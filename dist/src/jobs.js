@@ -7,7 +7,7 @@ import { StateStore } from "./state.js";
 import { maintenanceStatus, preflightWorkerLaunch, taskArtifactRoot, taskLocalLogPath } from "./execution.js";
 import { completeReadyTask, deriveTaskStatus } from "./task-status.js";
 import { WindowsTaskNotifier } from "./notifications.js";
-import { evaluateApprovalPolicy, parseVerificationRecords, projectVerificationCommands } from "./approval-policy.js";
+import { evaluateApprovalPolicy, parseStrictBuildVerificationEvidence, projectVerificationCommands } from "./approval-policy.js";
 import { DEFAULT_PROJECT_ID, ProjectRegistry } from "./projects.js";
 const DEFAULT_BUILD_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_REVIEW_TIMEOUT_MS = 8 * 60 * 1000;
@@ -307,6 +307,8 @@ export class JobService {
             reviewLog: task.review?.logPath ? (await readTextIfExists(task.review.logPath)) ?? "" : "",
             buildReport: (await readTextIfExists(buildReportFile(taskArtifactRoot(project)))) ?? null,
             reviewReport: (await readTextIfExists(reviewReportFile(taskArtifactRoot(project)))) ?? null,
+            verification: task.verification ?? [],
+            verificationEvents: task.verificationEvents ?? [],
             approvalActions: task.approvalActions ?? [],
             approval
         };
@@ -686,12 +688,23 @@ export class JobService {
                     ...(error ? { error } : {})
                 }
             }));
+            try {
+                await this.recordBuildVerification(taskId, project, status === "passed" ? "build-worker" : "failed-build");
+            }
+            catch (error) {
+                if (!/Unknown taskId/.test(errorMessage(error))) {
+                    throw error;
+                }
+            }
         };
         try {
             child = this.spawnJob({
                 projectRoot: taskArtifactRoot(project),
                 sandbox: "danger-full-access",
-                prompt: buildPrompt(taskId),
+                prompt: buildPrompt(taskId, {
+                    executionRoot: taskArtifactRoot(project),
+                    configuredCommands: projectVerificationCommands(project)
+                }),
                 logPath,
                 onError: (error) => {
                     void finalize("blocked", null, `Failed to spawn or run Codex build: ${error.message}`);
@@ -1043,6 +1056,30 @@ export class JobService {
         const runs = await this.store.listAutopilotRuns();
         return runs.find((run) => run.currentTaskId === taskId || run.queue.some((item) => item.taskId === taskId || item.fixAttemptForTaskId === taskId));
     }
+    async recordVerificationTimelineEvent(taskId, event) {
+        const run = await this.findRunForTask(taskId);
+        if (!run) {
+            return;
+        }
+        await this.store.updateAutopilotRun(run.id, (existing) => ({
+            ...existing,
+            timeline: [
+                ...existing.timeline,
+                {
+                    at: event.at,
+                    kind: "status",
+                    summary: `Task ${taskId} verification ${event.status}. ${event.explanation}`,
+                    data: {
+                        taskId,
+                        source: event.source,
+                        status: event.status,
+                        expectedCommands: event.expectedCommands,
+                        outputRef: event.outputRef
+                    }
+                }
+            ]
+        }));
+    }
     async completeTask(taskId, message) {
         const completedAt = this.now();
         const task = await this.updateTaskAndNotify(taskId, (existing) => completeReadyTask(existing, completedAt));
@@ -1065,26 +1102,109 @@ export class JobService {
             verification: task.verification
         });
     }
+    async recordBuildVerification(taskId, project, source) {
+        const task = await this.requireTask(taskId);
+        const commands = projectVerificationCommands(project);
+        if (commands.length === 0) {
+            return task;
+        }
+        const reportPath = buildReportFile(taskArtifactRoot(project));
+        const buildReport = await readTextIfExists(reportPath);
+        const reportMtimeMs = await fileMtimeMs(reportPath);
+        const recordedAt = this.now();
+        const strict = source === "build-worker"
+            ? parseStrictBuildVerificationEvidence({
+                buildReport,
+                taskId,
+                executionRoot: taskArtifactRoot(project),
+                outputRef: reportPath,
+                expectedOutputRef: reportPath,
+                configuredCommands: commands,
+                startedAt: task.build.startedAt,
+                endedAt: task.build.endedAt,
+                recordedAt,
+                reportMtimeMs,
+                source: "build-worker"
+            })
+            : {
+                ok: false,
+                reason: "Build did not pass, so configured command verification remains unknown.",
+                records: unknownVerificationRecords(task, project, commands, reportPath, recordedAt, "build-worker")
+            };
+        const records = strict.ok
+            ? strict.records
+            : strict.records.length > 0
+                ? withEvidenceExplanation(strict.records, strict.reason)
+                : unknownVerificationRecords(task, project, commands, reportPath, recordedAt, "build-worker", strict.reason);
+        const event = verificationAuditEvent({
+            taskId,
+            project,
+            commands,
+            reportPath,
+            at: recordedAt,
+            kind: "verification-recorded",
+            source: "build-worker",
+            status: strict.ok ? "passed" : "unknown",
+            explanation: strict.ok ? strict.explanation : strict.reason
+        });
+        const updated = await this.store.updateTask(taskId, (existing) => ({
+            ...existing,
+            verification: records,
+            verificationEvents: [...(existing.verificationEvents ?? []), event]
+        }));
+        return updated;
+    }
     async reconcileVerification(taskId) {
         const task = await this.requireTask(taskId);
         const project = await this.projectForTask(task);
-        const buildReport = await readTextIfExists(buildReportFile(taskArtifactRoot(project)));
-        const verification = parseVerificationRecords({
+        const commands = projectVerificationCommands(project);
+        if (commands.length === 0 || hasCompleteCurrentVerification(task.verification, commands)) {
+            return task;
+        }
+        const reportPath = buildReportFile(taskArtifactRoot(project));
+        const buildReport = await readTextIfExists(reportPath);
+        const reportMtimeMs = await fileMtimeMs(reportPath);
+        const recordedAt = this.now();
+        const strict = parseStrictBuildVerificationEvidence({
             buildReport,
-            configuredCommands: projectVerificationCommands(project),
+            taskId,
+            executionRoot: taskArtifactRoot(project),
+            outputRef: reportPath,
+            expectedOutputRef: reportPath,
+            configuredCommands: commands,
             startedAt: task.build.startedAt,
             endedAt: task.build.endedAt,
-            outputRef: buildReportFile(taskArtifactRoot(project))
+            recordedAt,
+            reportMtimeMs,
+            source: "reconciled-from-evidence"
         });
-        if (verification.length === 0 && (!task.verification || task.verification.length === 0)) {
+        const existingCurrent = currentVerificationByCommand(task.verification ?? []);
+        const records = strict.ok && (task.verification?.length ?? 0) === 0
+            ? strict.records
+            : mergeVerificationRecords(task.verification ?? [], strict.ok
+                ? strict.records
+                : withEvidenceExplanation(strict.records.length > 0
+                    ? strict.records
+                    : unknownVerificationRecords(task, project, commands.filter((command) => !existingCurrent.has(normalizeCommand(command))), reportPath, recordedAt, "reconciled-from-evidence"), strict.reason));
+        if (JSON.stringify(task.verification ?? []) === JSON.stringify(records)) {
             return task;
         }
-        if (JSON.stringify(task.verification ?? []) === JSON.stringify(verification)) {
-            return task;
-        }
+        const event = verificationAuditEvent({
+            taskId,
+            project,
+            commands,
+            reportPath,
+            at: recordedAt,
+            kind: "verification-reconciled",
+            source: "reconciled-from-evidence",
+            status: strict.ok ? "reconciled-from-evidence" : "unknown",
+            explanation: strict.ok ? strict.explanation : strict.reason
+        });
+        await this.recordVerificationTimelineEvent(taskId, event);
         return await this.store.updateTask(taskId, (existing) => ({
             ...existing,
-            verification
+            verification: records,
+            verificationEvents: [...(existing.verificationEvents ?? []), event]
         }));
     }
     async updatePlan(planId, updater) {
@@ -1121,6 +1241,8 @@ export class JobService {
                 configuredCommands: projectVerificationCommands(project),
                 verification: task.verification
             }),
+            verificationStatus: verificationDisplayStatus(task, projectVerificationCommands(project)),
+            verificationSummary: summarizeVerification(task, projectVerificationCommands(project)),
             buildSummary: summarizeBuild(task),
             reviewResult: task.review?.result ?? null,
             latestLogLines: latestLogTail ? latestLogTail.split(/\r?\n/) : []
@@ -1176,6 +1298,131 @@ function defaultProcessExists(pid) {
         const code = error.code;
         return code === "EPERM";
     }
+}
+async function fileMtimeMs(filePath) {
+    try {
+        return (await fs.stat(assertAllowedPath(filePath))).mtimeMs;
+    }
+    catch (error) {
+        if (error.code === "ENOENT") {
+            return undefined;
+        }
+        throw error;
+    }
+}
+function hasCompleteCurrentVerification(records, commands) {
+    const current = currentVerificationByCommand(records ?? []);
+    return commands.every((command) => {
+        const record = current.get(normalizeCommand(command));
+        return record && record.status !== "unknown";
+    });
+}
+function currentVerificationByCommand(records) {
+    const current = new Map();
+    for (const record of records) {
+        if (record.isCurrent) {
+            current.set(normalizeCommand(record.command), record);
+        }
+    }
+    return current;
+}
+function mergeVerificationRecords(existing, candidate) {
+    const candidateByCommand = new Map(candidate.map((record) => [normalizeCommand(record.command), record]));
+    const merged = existing.map((record) => {
+        if (!record.isCurrent) {
+            return record;
+        }
+        const next = candidateByCommand.get(normalizeCommand(record.command));
+        if (!next || record.status !== "unknown") {
+            return record;
+        }
+        candidateByCommand.delete(normalizeCommand(record.command));
+        return next;
+    });
+    for (const record of candidateByCommand.values()) {
+        if (!existing.some((item) => item.isCurrent && normalizeCommand(item.command) === normalizeCommand(record.command))) {
+            merged.push(record);
+        }
+    }
+    return merged;
+}
+function unknownVerificationRecords(task, project, commands, reportPath, recordedAt, source, explanation = "Configured command verification is unknown.") {
+    return commands.map((command) => ({
+        command,
+        attempt: 1,
+        startedAt: task.build.startedAt,
+        endedAt: task.build.endedAt,
+        exitCode: null,
+        status: "unknown",
+        outputRef: reportPath,
+        isCurrent: true,
+        evidence: {
+            source,
+            taskId: task.id,
+            executionRoot: taskArtifactRoot(project),
+            expectedCommands: commands,
+            outputRef: reportPath,
+            recordedAt,
+            explanation
+        }
+    }));
+}
+function withEvidenceExplanation(records, explanation) {
+    return records.map((record) => ({
+        ...record,
+        evidence: record.evidence
+            ? {
+                ...record.evidence,
+                explanation
+            }
+            : record.evidence
+    }));
+}
+function verificationAuditEvent(input) {
+    return {
+        at: input.at,
+        kind: input.kind,
+        source: input.source,
+        status: input.status,
+        taskId: input.taskId,
+        executionRoot: taskArtifactRoot(input.project),
+        expectedCommands: input.commands,
+        outputRef: input.reportPath,
+        explanation: input.explanation
+    };
+}
+function verificationDisplayStatus(task, commands) {
+    const current = currentVerificationByCommand(task.verification ?? []);
+    const records = commands.map((command) => current.get(normalizeCommand(command)));
+    if (commands.length === 0 || records.some((record) => !record || record.status === "unknown")) {
+        return "unknown";
+    }
+    if (records.some((record) => record?.status === "failed")) {
+        return "failed";
+    }
+    if (records.some((record) => record?.evidence?.source === "reconciled-from-evidence")) {
+        return "reconciled-from-evidence";
+    }
+    return "passed";
+}
+function summarizeVerification(task, commands) {
+    if (commands.length === 0) {
+        return "No configured verification commands.";
+    }
+    const current = currentVerificationByCommand(task.verification ?? []);
+    const lines = commands.map((command) => {
+        const record = current.get(normalizeCommand(command));
+        if (!record) {
+            return `${command}: unknown (missing structured result)`;
+        }
+        const source = record.evidence?.source ? `, ${record.evidence.source}` : "";
+        const explanation = record.status === "unknown" && record.evidence?.explanation ? ` - ${record.evidence.explanation}` : "";
+        return `${command}: ${record.status}${source}${explanation}`;
+    });
+    return lines.join("\n");
+}
+function normalizeCommand(command) {
+    return command.trim().replace(/\s+/g, " ").toLowerCase();
 }
 function isBuildActive(task) {
     return task.status === "building" || task.build.status === "running";
@@ -1304,7 +1551,7 @@ function collectErrors(task) {
     return [task.build.error, task.review?.error].filter((error) => Boolean(error));
 }
 function assertManualApprovalAllowed(approval, reviewedRiskEvidence) {
-    const hardBlocks = approval.reasons.filter((reason) => /Build status is not passed|Review result\/status is not pass|Configured command results are missing|Current configured command results are not passing|BUILD_REPORT\.md is missing|No configured test\/check\/lint\/build command evidence|Reviewer blocker|Task status is .*not ready-for-approval/i.test(reason));
+    const hardBlocks = approval.reasons.filter((reason) => /Build status is not passed|Review result\/status is not pass|Configured command results are missing|Configured command results are unknown|Current configured command results are not passing|BUILD_REPORT\.md is missing|No configured test\/check\/lint\/build command evidence|Reviewer blocker|Task status is .*not ready-for-approval/i.test(reason));
     if (hardBlocks.length > 0) {
         throw new Error(`Manual approval is not allowed until required build, verification, and review gates pass: ${hardBlocks.join(" ")}`);
     }

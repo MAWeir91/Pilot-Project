@@ -946,6 +946,8 @@ function toDashboardTask(task: TaskSummary): Omit<TaskSummary, "latestLogLines">
     codexApprovalPolicy: task.codexApprovalPolicy,
     codexAccessWarning: task.codexAccessWarning,
     approval: task.approval,
+    verificationStatus: task.verificationStatus,
+    verificationSummary: task.verificationSummary,
     buildSummary: task.buildSummary,
     reviewResult: task.reviewResult,
     latestLogPreview: summarizeLogPreview(task.latestLogLines)

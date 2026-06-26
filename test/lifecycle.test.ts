@@ -41,6 +41,61 @@ describe("job lifecycle reconciliation", () => {
     expect(saved?.review?.error).toMatch(/spawn denied/);
   });
 
+  it("persists structured passed command results when a build worker completes", async () => {
+    const projectPath = dataPath("lifecycle-build-complete-project");
+    const registryFile = dataPath("lifecycle-build-complete-projects.json");
+    STATE_FILES.push(projectPath, registryFile);
+    await fs.mkdir(projectPath, { recursive: true });
+    const projects = new ProjectRegistry(registryFile, () => "2026-06-24T02:10:00.000Z");
+    await projects.registerProject({
+      id: "lifecycle-build-complete-project",
+      name: "Lifecycle Build Complete Project",
+      path: projectPath,
+      buildCommand: "npm run build",
+      testCommand: "npm test",
+      checkCommand: "npm run check",
+      defaultBranchName: "main",
+      allowedGitBehavior: "feature branches and local commits"
+    });
+    let onClose: ((exitCode: number | null, signal: NodeJS.Signals | null, stdoutText: string) => void) | undefined;
+    const spawnJob = vi.fn((options: { onClose?: typeof onClose }) => {
+      onClose = options.onClose;
+      return fakeChild(2222);
+    });
+    const stateFile = await writeState({ tasks: [] });
+    const store = new StateStore(stateFile);
+    const service = new JobService(store, new NullTaskNotifier(), {
+      projects,
+      spawnJob,
+      processExists: () => true,
+      now: () => "2026-06-24T02:10:00.000Z"
+    });
+
+    const started = await service.startBuild({
+      projectId: "lifecycle-build-complete-project",
+      title: "Persist build verification",
+      requirements: "Exercise build completion.",
+      acceptanceCriteria: ["Structured verification is stored."]
+    });
+    await waitFor(() => expect(spawnJob).toHaveBeenCalledTimes(1));
+    await fs.writeFile(`${projectPath}\\BUILD_REPORT.md`, buildReportFor(started.taskId), "utf8");
+    onClose?.(0, null, "");
+    await waitFor(async () => {
+      const saved = await store.getTask(started.taskId);
+      expect(saved?.build.status).toBe("passed");
+      expect(saved?.verification?.every((record) => record.status === "passed")).toBe(true);
+    });
+    const saved = await store.getTask(started.taskId);
+
+    expect(saved?.verification).toHaveLength(3);
+    expect(saved?.verification?.every((record) => record.evidence?.source === "build-worker")).toBe(true);
+    expect(saved?.verificationEvents?.[0]).toMatchObject({
+      kind: "verification-recorded",
+      source: "build-worker",
+      status: "passed"
+    });
+  });
+
   it("reconciles an active review with no PID as blocked", async () => {
     const { service, store } = await serviceWithTask({
       ...passedBuildTask(),
@@ -148,6 +203,8 @@ describe("job lifecycle reconciliation", () => {
       [
         "# Build Report",
         "",
+        `Task ID: ${TASK_ID}`,
+        "",
         "## Commands Run and Results",
         "",
         "- `npm test`",
@@ -155,7 +212,11 @@ describe("job lifecycle reconciliation", () => {
         "- `npm run check`",
         "  - Result: passed; checks passed.",
         "- `npm run build`",
-        "  - Result: passed; build passed."
+        "  - Result: passed; build passed.",
+        "",
+        "## Final Status",
+        "",
+        "passed"
       ].join("\n"),
       "utf8"
     );
@@ -291,4 +352,39 @@ function fakeChild(pid: number) {
     },
     kill: vi.fn()
   } as never;
+}
+
+function buildReportFor(taskId: string): string {
+  return [
+    "# Build Report",
+    "",
+    `Task ID: ${taskId}`,
+    "",
+    "## Commands Run and Results",
+    "",
+    "- `npm test` - passed. Tests passed.",
+    "- `npm run check` - passed. Checks passed.",
+    "- `npm run build` - passed. Build passed.",
+    "",
+    "## Final Status",
+    "",
+    "passed"
+  ].join("\n");
+}
+
+async function waitFor(assertion: () => void | Promise<void>): Promise<void> {
+  const deadline = Date.now() + 1000;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    try {
+      await assertion();
+      return;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  if (lastError) {
+    throw lastError;
+  }
 }

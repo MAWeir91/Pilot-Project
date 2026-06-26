@@ -102,8 +102,8 @@ export function renderDashboardHtml(): string {
       font-weight: 650;
       white-space: nowrap;
     }
-    .status.ready-for-approval, .status.build-passed, .status.completed { color: var(--good); }
-    .status.needs-fixes { color: var(--warn); }
+    .status.ready-for-approval, .status.build-passed, .status.completed, .status.passed, .status.reconciled-from-evidence { color: var(--good); }
+    .status.needs-fixes, .status.unknown { color: var(--warn); }
     .status.failed, .status.stopped { color: var(--bad); }
     .preview {
       max-width: 420px;
@@ -221,7 +221,7 @@ export function renderDashboardHtml(): string {
     const detailsTitle = document.getElementById("details-title");
     const detailsSubtitle = document.getElementById("details-subtitle");
     const detailsBody = document.getElementById("details-body");
-    const fields = ["Task", "Project", "Task ID", "Updated", "Status", "Codex Access", "Approval", "Risks", "Build", "Review", "Recent activity", ""];
+    const fields = ["Task", "Project", "Task ID", "Updated", "Status", "Codex Access", "Approval", "Verification", "Risks", "Build", "Review", "Recent activity", ""];
     const planFields = ["Plan", "Project", "Plan ID", "Updated", "Status", "Summary", "Recent activity", ""];
 
     function text(value) {
@@ -259,6 +259,7 @@ export function renderDashboardHtml(): string {
           '<td><span class="status ' + escapeHtml(task.status) + '">' + escapeHtml(task.status) + '</span></td>' +
           '<td class="preview">' + escapeHtml(codexAccess) + '</td>' +
           '<td>' + escapeHtml(text(approval.mode)) + '<div class="muted">' + escapeHtml(approvalReasons) + '</div></td>' +
+          '<td><span class="status ' + escapeHtml(task.verificationStatus) + '">' + escapeHtml(text(task.verificationStatus)) + '</span><div class="muted preview">' + escapeHtml(text(task.verificationSummary)) + '</div></td>' +
           '<td>' + escapeHtml(risks) + '</td>' +
           '<td>' + escapeHtml(task.buildSummary) + '</td>' +
           '<td>' + escapeHtml(text(task.reviewResult)) + '</td>' +
@@ -597,12 +598,14 @@ export function renderDashboardHtml(): string {
           fact("Codex Access Mode", task.codexAccessMode) +
           fact("Codex Approval Policy", task.codexApprovalPolicy) +
           fact("Approval Mode", task.approval && task.approval.mode) +
+          fact("Verification", task.verificationStatus) +
           fact("Risk Flags", task.approval && Array.isArray(task.approval.riskFlags) && task.approval.riskFlags.length ? task.approval.riskFlags.join(", ") : "none") +
           fact("Created", task.createdAt) +
           fact("Updated", task.updatedAt) +
         '</div>' +
         section("Codex Access Warning", task.codexAccessWarning) +
         section("Approval Policy", task.approval && Array.isArray(task.approval.reasons) ? task.approval.reasons.join("\\n") : "-") +
+        section("Verification", verificationText(task)) +
         section("Risk Evidence", task.approval ? approvalEvidenceText(task.approval) : "-") +
         section("Approval Actions", approvalActions) +
         section("Requirements", task.requirements) +
@@ -628,6 +631,25 @@ export function renderDashboardHtml(): string {
           ).join("\\n")
         : "No risk evidence.";
       return "Reasons:\\n" + reasons + "\\n\\nRisk evidence:\\n" + evidence;
+    }
+
+    function verificationText(task) {
+      const records = Array.isArray(task.verification) && task.verification.length
+        ? task.verification.map((item) =>
+            "- " + text(item.command) + " | attempt " + text(item.attempt) + " | " + text(item.status) + " | current=" + text(item.isCurrent) + "\\n" +
+            "  Source: " + text(item.evidence && item.evidence.source) + "\\n" +
+            "  Output: " + text(item.outputRef) + "\\n" +
+            "  Explanation: " + text(item.evidence && item.evidence.explanation)
+          ).join("\\n")
+        : "No structured verification records.";
+      const events = Array.isArray(task.verificationEvents) && task.verificationEvents.length
+        ? task.verificationEvents.map((item) =>
+            "- " + text(item.at) + " | " + text(item.kind) + " | " + text(item.status) + " | " + text(item.source) + "\\n" +
+            "  " + text(item.explanation)
+          ).join("\\n")
+        : "No verification audit events.";
+      return "Status: " + text(task.verificationStatus) + "\\n" +
+        text(task.verificationSummary) + "\\n\\nRecords:\\n" + records + "\\n\\nAudit events:\\n" + events;
     }
 
     function renderPlanDetails(plan) {

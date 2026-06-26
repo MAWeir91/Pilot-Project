@@ -46,7 +46,26 @@ describe("MCP server connector metadata", () => {
                         logPath: reviewLogFile,
                         startedAt: "2026-06-24T01:00:02.000Z",
                         endedAt: "2026-06-24T01:00:03.000Z"
-                    }
+                    },
+                    verification: ["npm test", "npm run check", "npm run build"].map((command) => ({
+                        command,
+                        attempt: 1,
+                        startedAt: "2026-06-24T01:00:01.000Z",
+                        endedAt: "2026-06-24T01:00:02.000Z",
+                        exitCode: 0,
+                        status: "passed",
+                        outputRef: "server-test-fixture",
+                        isCurrent: true,
+                        evidence: {
+                            source: "build-worker",
+                            taskId,
+                            executionRoot: "server-test-fixture",
+                            expectedCommands: ["npm test", "npm run check", "npm run build"],
+                            outputRef: "server-test-fixture",
+                            recordedAt: "2026-06-24T01:00:02.000Z",
+                            explanation: "Persisted by test fixture."
+                        }
+                    }))
                 }
             ],
             plans: [

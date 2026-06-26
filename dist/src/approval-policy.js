@@ -75,6 +75,8 @@ const RISK_PATTERNS = [
 ];
 const PASSED_RESULT_PATTERN = /\b(?:result|status|final status)\s*:\s*passed\b/i;
 const FAILED_RESULT_PATTERN = /\b(?:result|status|final status)\s*:\s*(?:failed|error|blocked)\b/i;
+const INLINE_PASSED_RESULT_PATTERN = /`[^`]+`\s*[-:]\s*passed\b/i;
+const INLINE_FAILED_RESULT_PATTERN = /`[^`]+`\s*[-:]\s*(?:failed|error|blocked)\b/i;
 const NO_COMMANDS_PATTERN = /\bno\s+(?:test|check|lint|build|configured|available|npm|package\.json)[^\n]*(?:command|commands|available|configuration|exists)/i;
 const COMMAND_KEYWORDS = /\b(test|check|lint|build)\b/i;
 export function approvalMode() {
@@ -150,7 +152,8 @@ export function parseVerificationRecords(options) {
             exitCode: resultStatus(block) === "passed" ? 0 : resultStatus(block) === "failed" ? 1 : null,
             status: resultStatus(block),
             outputRef: options.outputRef,
-            isCurrent: false
+            isCurrent: false,
+            ...(options.evidence ? { evidence: options.evidence } : {})
         });
     }
     const latestByCommand = new Map();
@@ -161,6 +164,126 @@ export function parseVerificationRecords(options) {
         ...record,
         isCurrent: latestByCommand.get(record.command) === index
     }));
+}
+export function parseStrictBuildVerificationEvidence(options) {
+    const configuredCommands = uniqueCommands(options.configuredCommands);
+    if (configuredCommands.length === 0) {
+        return { ok: false, reason: "No configured commands are available for strict verification reconciliation.", records: [] };
+    }
+    if (!options.buildReport?.trim()) {
+        return { ok: false, reason: "BUILD_REPORT.md is missing or empty.", records: unknownRecords(options, configuredCommands) };
+    }
+    if (!samePath(options.outputRef, options.expectedOutputRef)) {
+        return {
+            ok: false,
+            reason: `BUILD_REPORT.md path mismatch. Expected ${options.expectedOutputRef}; found ${options.outputRef}.`,
+            records: unknownRecords(options, configuredCommands)
+        };
+    }
+    const taskIds = [...options.buildReport.matchAll(/\bTask ID:\s*(task-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-[a-f0-9]{8})\b/gi)].map((match) => match[1]);
+    const uniqueTaskIds = [...new Set(taskIds)];
+    if (uniqueTaskIds.length !== 1 || uniqueTaskIds[0] !== options.taskId) {
+        const found = uniqueTaskIds.length > 0 ? uniqueTaskIds.join(", ") : "none";
+        return {
+            ok: false,
+            reason: `BUILD_REPORT.md task identity mismatch. Expected ${options.taskId}; found ${found}.`,
+            records: unknownRecords(options, configuredCommands)
+        };
+    }
+    if (options.startedAt && options.reportMtimeMs !== undefined && options.reportMtimeMs < Date.parse(options.startedAt)) {
+        return {
+            ok: false,
+            reason: "BUILD_REPORT.md appears stale because its file timestamp is older than the recorded build start.",
+            records: unknownRecords(options, configuredCommands)
+        };
+    }
+    const blocks = commandBlocks(options.buildReport);
+    const records = parseVerificationRecords({
+        buildReport: options.buildReport,
+        configuredCommands,
+        startedAt: options.startedAt,
+        endedAt: options.endedAt,
+        outputRef: options.outputRef,
+        evidence: {
+            source: options.source ?? "reconciled-from-evidence",
+            taskId: options.taskId,
+            executionRoot: options.executionRoot,
+            expectedCommands: configuredCommands,
+            outputRef: options.outputRef,
+            recordedAt: options.recordedAt,
+            explanation: strictEvidenceExplanation(options.source ?? "reconciled-from-evidence")
+        }
+    });
+    const extractedCommands = uniqueCommands(blocks.map(extractCommand));
+    const unexpectedCommands = extractedCommands.filter((command) => !configuredCommands.some((expected) => sameCommand(expected, command)));
+    const missingCommands = configuredCommands.filter((command) => !extractedCommands.some((actual) => sameCommand(actual, command)));
+    if (unexpectedCommands.length > 0 || missingCommands.length > 0) {
+        return {
+            ok: false,
+            reason: [
+                unexpectedCommands.length ? `unexpected commands: ${unexpectedCommands.join(", ")}` : "",
+                missingCommands.length ? `missing commands: ${missingCommands.join(", ")}` : ""
+            ]
+                .filter(Boolean)
+                .join("; "),
+            records: records.length > 0
+                ? [
+                    ...records,
+                    ...unknownRecords({
+                        ...options,
+                        configuredCommands: missingCommands
+                    }, missingCommands)
+                ]
+                : unknownRecords(options, configuredCommands)
+        };
+    }
+    const finalStatuses = extractFinalStatuses(options.buildReport);
+    if (finalStatuses.length !== 1 || finalStatuses[0] !== "passed") {
+        const found = finalStatuses.join(", ") || "none";
+        return {
+            ok: false,
+            reason: `BUILD_REPORT.md final status is not exactly one passed value; found ${found}.`,
+            records: finalStatuses.length === 1 ? (records.length > 0 ? records : unknownRecords(options, configuredCommands)) : unknownRecords(options, configuredCommands)
+        };
+    }
+    const currentFailures = configuredCommands
+        .map((command) => [...records].reverse().find((record) => sameCommand(record.command, command) && record.isCurrent))
+        .filter((record) => Boolean(record))
+        .filter((record) => record.status !== "passed");
+    const missingCurrent = configuredCommands.filter((command) => !records.some((record) => sameCommand(record.command, command) && record.isCurrent));
+    if (missingCurrent.length > 0 || currentFailures.length > 0) {
+        return {
+            ok: false,
+            reason: [
+                missingCurrent.length ? `missing current command results: ${missingCurrent.join(", ")}` : "",
+                currentFailures.length
+                    ? `current command results are not passed: ${currentFailures.map((record) => `${record.command} (${record.status})`).join(", ")}`
+                    : ""
+            ]
+                .filter(Boolean)
+                .join("; "),
+            records: records.length > 0 ? records : unknownRecords(options, configuredCommands)
+        };
+    }
+    return {
+        ok: true,
+        records,
+        explanation: strictEvidenceExplanation(options.source ?? "reconciled-from-evidence")
+    };
+}
+function extractFinalStatuses(buildReport) {
+    const statuses = [];
+    const lines = buildReport.split(/\r?\n/);
+    for (let index = 0; index < lines.length; index += 1) {
+        if (!/^##\s+Final Status\s*$/i.test(lines[index].trim())) {
+            continue;
+        }
+        const value = lines.slice(index + 1).find((line) => line.trim().length > 0)?.trim().replace(/^[-*]\s*/, "");
+        if (value && /^(passed|failed|blocked|unknown)\b/i.test(value)) {
+            statuses.push(value.match(/^(passed|failed|blocked|unknown)\b/i)[1].toLowerCase());
+        }
+    }
+    return statuses;
 }
 export function assertNoRiskFlagsForManualApproval(decision) {
     if (decision.riskFlags.length > 0) {
@@ -405,18 +528,18 @@ function extractRiskRelevantReportText(report) {
 function evaluateCommandEvidence(options) {
     const configuredCommands = uniqueCommands(options.configuredCommands ?? []);
     if (configuredCommands.length > 0) {
-        const records = options.verification && options.verification.length > 0
-            ? options.verification
-            : parseVerificationRecords({
-                buildReport: options.buildReport,
-                configuredCommands
-            });
+        const records = options.verification ?? [];
         const missing = [];
         const failing = [];
+        const unknown = [];
         for (const command of configuredCommands) {
             const current = [...records].reverse().find((record) => sameCommand(record.command, command) && record.isCurrent);
             if (!current) {
                 missing.push(command);
+                continue;
+            }
+            if (current.status === "unknown") {
+                unknown.push(command);
                 continue;
             }
             if (current.status !== "passed") {
@@ -425,6 +548,9 @@ function evaluateCommandEvidence(options) {
         }
         if (missing.length > 0) {
             return { ok: false, reason: `Configured command results are missing for: ${missing.join(", ")}.` };
+        }
+        if (unknown.length > 0) {
+            return { ok: false, reason: `Configured command results are unknown for: ${unknown.join(", ")}.` };
         }
         if (failing.length > 0) {
             return { ok: false, reason: `Current configured command results are not passing for: ${failing.join(", ")}.` };
@@ -454,11 +580,17 @@ function extractCommand(block) {
     return block.match(/-\s+`([^`]+)`/)?.[1]?.trim();
 }
 function resultStatus(block) {
+    if (FAILED_RESULT_PATTERN.test(block)) {
+        return "failed";
+    }
+    if (INLINE_FAILED_RESULT_PATTERN.test(block)) {
+        return "failed";
+    }
     if (PASSED_RESULT_PATTERN.test(block)) {
         return "passed";
     }
-    if (FAILED_RESULT_PATTERN.test(block)) {
-        return "failed";
+    if (INLINE_PASSED_RESULT_PATTERN.test(block)) {
+        return "passed";
     }
     return "unknown";
 }
@@ -474,6 +606,35 @@ function uniqueCommands(commands) {
 }
 function sameCommand(left, right) {
     return left.trim().replace(/\s+/g, " ").toLowerCase() === right.trim().replace(/\s+/g, " ").toLowerCase();
+}
+function samePath(left, right) {
+    return left.trim().replace(/[\\/]+/g, "/").toLowerCase() === right.trim().replace(/[\\/]+/g, "/").toLowerCase();
+}
+function unknownRecords(options, configuredCommands) {
+    return configuredCommands.map((command) => ({
+        command,
+        attempt: 1,
+        startedAt: options.startedAt,
+        endedAt: options.endedAt,
+        exitCode: null,
+        status: "unknown",
+        outputRef: options.outputRef,
+        isCurrent: true,
+        evidence: {
+            source: "reconciled-from-evidence",
+            taskId: options.taskId,
+            executionRoot: options.executionRoot,
+            expectedCommands: configuredCommands,
+            outputRef: options.outputRef,
+            recordedAt: options.recordedAt,
+            explanation: "Strict BUILD_REPORT.md reconciliation did not find valid passed command evidence."
+        }
+    }));
+}
+function strictEvidenceExplanation(source) {
+    return source === "build-worker"
+        ? "Build completion recorded structured command results after matching task identity, execution root, expected commands, and passed command results."
+        : "Strict BUILD_REPORT.md reconciliation matched task identity, execution root, expected commands, and passed command results.";
 }
 function hasReviewerBlocker(reviewReport) {
     if (!reviewReport) {

@@ -68,6 +68,18 @@ export interface ApprovalActionRecord {
 }
 
 export type VerificationStatus = "passed" | "failed" | "unknown";
+export type VerificationEvidenceSource = "build-worker" | "reconciled-from-evidence";
+export type VerificationDisplayStatus = VerificationStatus | "reconciled-from-evidence";
+
+export interface VerificationEvidenceRef {
+  source: VerificationEvidenceSource;
+  taskId: string;
+  executionRoot: string;
+  expectedCommands: string[];
+  outputRef: string;
+  recordedAt: string;
+  explanation: string;
+}
 
 export interface VerificationRecord {
   command: string;
@@ -78,6 +90,19 @@ export interface VerificationRecord {
   status: VerificationStatus;
   outputRef?: string;
   isCurrent: boolean;
+  evidence?: VerificationEvidenceRef;
+}
+
+export interface VerificationAuditEvent {
+  at: string;
+  kind: "verification-reconciled" | "verification-recorded";
+  source: VerificationEvidenceSource;
+  status: VerificationDisplayStatus;
+  taskId: string;
+  executionRoot: string;
+  expectedCommands: string[];
+  outputRef: string;
+  explanation: string;
 }
 
 export interface TaskInput {
@@ -145,6 +170,7 @@ export interface TaskRecord {
   build: JobRecord;
   review?: ReviewRecord;
   verification?: VerificationRecord[];
+  verificationEvents?: VerificationAuditEvent[];
   approvalActions?: ApprovalActionRecord[];
 }
 
@@ -168,6 +194,8 @@ export interface TaskSummary {
   codexApprovalPolicy: string;
   codexAccessWarning: string;
   approval: ApprovalDecision;
+  verificationStatus: VerificationDisplayStatus;
+  verificationSummary: string;
   buildSummary: string;
   reviewResult: ReviewResult | null;
   latestLogLines: string[];
@@ -247,6 +275,8 @@ export interface TaskDetails extends TaskSummary {
   reviewLog: string;
   buildReport: string | null;
   reviewReport: string | null;
+  verification: VerificationRecord[];
+  verificationEvents: VerificationAuditEvent[];
   approvalActions?: ApprovalActionRecord[];
 }
 

@@ -79,6 +79,41 @@ describe("task approval", () => {
     expect(saved?.completedAt).toBe("2026-06-24T03:10:00.000Z");
   });
 
+  it("approves from durable structured passed command evidence without BUILD_REPORT.md command parsing", async () => {
+    const { service, store } = await serviceWithTask(
+      {
+        ...readyTask(),
+        verification: durableVerification()
+      },
+      { buildReport: "" }
+    );
+
+    const result = await service.finalizeTask(TASK_ID);
+    const saved = await store.getTask(TASK_ID);
+
+    expect(result.status).toBe("completed");
+    expect(saved?.verification?.every((record) => record.evidence?.source === "build-worker")).toBe(true);
+  });
+
+  it("strictly reconciles valid legacy build evidence and records audit visibility", async () => {
+    const { service, store } = await serviceWithTask(readyTask(), { withRun: true });
+
+    const result = await service.finalizeTask(TASK_ID);
+    const saved = await store.getTask(TASK_ID);
+    const run = (await store.listAutopilotRuns())[0];
+
+    expect(result.status).toBe("completed");
+    expect(saved?.verification?.every((record) => record.status === "passed")).toBe(true);
+    expect(saved?.verification?.some((record) => record.evidence?.source === "reconciled-from-evidence")).toBe(true);
+    expect(saved?.verificationEvents?.[0]).toMatchObject({
+      kind: "verification-reconciled",
+      source: "reconciled-from-evidence",
+      status: "reconciled-from-evidence",
+      taskId: TASK_ID
+    });
+    expect(run.timeline.some((entry) => entry.summary.includes("verification reconciled-from-evidence"))).toBe(true);
+  });
+
   it("treats a later successful retry as the effective configured command result", async () => {
     const { service, store } = await serviceWithTask(readyTask(), {
       buildReport: approvalBuildReportWithTestRetry()
@@ -122,6 +157,41 @@ describe("task approval", () => {
     expect(saved?.verification?.find((record) => record.command === "npm test" && record.isCurrent)).toMatchObject({
       status: "failed"
     });
+  });
+
+  it.each([
+    ["mismatched task identity", approvalBuildReport({ taskId: "task-2026-06-24T03-00-00-000Z-aaaaaaaa" }), /task identity mismatch/],
+    [
+      "ambiguous task identities",
+      [approvalBuildReport(), "", "Task ID: task-2026-06-24T03-00-00-000Z-aaaaaaaa"].join("\n"),
+      /task identity mismatch/
+    ],
+    ["missing report", "", /missing or empty/],
+    ["missing command", approvalBuildReport({ omitCommand: "npm run check" }), /missing commands: npm run check/],
+    ["ambiguous final status", approvalBuildReport({ extraFinalStatus: "failed" }), /final status is not exactly one passed/]
+  ])("rejects %s legacy evidence and keeps verification unknown", async (_label, buildReport, reason) => {
+    const { service, store } = await serviceWithTask(readyTask(), { buildReport });
+
+    const result = await service.finalizeTask(TASK_ID);
+    const saved = await store.getTask(TASK_ID);
+
+    expect(result.status).toBe("manual_approval_required");
+    expect(result.reasons).toEqual(expect.arrayContaining([expect.stringMatching(/unknown|missing|not passing/i)]));
+    expect(saved?.status).toBe("ready-for-approval");
+    expect(saved?.verification?.some((record) => record.status === "unknown")).toBe(true);
+    expect(saved?.verificationEvents?.[0]?.explanation).toMatch(reason);
+  });
+
+  it("does not approve when structured configured command results remain unknown", async () => {
+    const { service } = await serviceWithTask({
+      ...readyTask(),
+      verification: durableVerification("unknown")
+    }, { buildReport: "" });
+
+    const result = await service.finalizeTask(TASK_ID);
+
+    expect(result.status).toBe("manual_approval_required");
+    expect(result.reasons).toEqual(expect.arrayContaining([expect.stringMatching(/unknown/)]));
   });
 
   it("does not treat no-deployment language as deployment risk", async () => {
@@ -487,28 +557,35 @@ function approvalRun(): AutopilotRunRecord {
   };
 }
 
-function approvalBuildReport(): string {
+function approvalBuildReport(
+  options: { taskId?: string; omitCommand?: string; extraFinalStatus?: "passed" | "failed" | "blocked" } = {}
+): string {
+  const commands = [
+    ["npm test", "passed; test suite completed."],
+    ["npm run check", "passed; lint and typecheck completed."],
+    ["npm run build", "passed; production build completed."]
+  ].filter(([command]) => command !== options.omitCommand);
   return [
     "# Build Report",
     "",
+    `Task ID: ${options.taskId ?? TASK_ID}`,
+    "",
     "## Commands Run and Results",
     "",
-    "- `npm test`",
-    "  - Result: passed; test suite completed.",
-    "- `npm run check`",
-    "  - Result: passed; lint and typecheck completed.",
-    "- `npm run build`",
-    "  - Result: passed; production build completed.",
+    ...commands.flatMap(([command, result]) => [`- \`${command}\``, `  - Result: ${result}`]),
     "",
     "## Final Status",
     "",
-    "passed"
+    "passed",
+    ...(options.extraFinalStatus ? ["", "## Final Status", "", options.extraFinalStatus] : [])
   ].join("\n");
 }
 
 function approvalBuildReportWithTestRetry(): string {
   return [
     "# Build Report",
+    "",
+    `Task ID: ${TASK_ID}`,
     "",
     "## Commands Run and Results",
     "",
@@ -531,6 +608,8 @@ function approvalBuildReportWithFailedTestOnly(): string {
   return [
     "# Build Report",
     "",
+    `Task ID: ${TASK_ID}`,
+    "",
     "## Commands Run and Results",
     "",
     "- `npm test`",
@@ -544,6 +623,28 @@ function approvalBuildReportWithFailedTestOnly(): string {
     "",
     "failed"
   ].join("\n");
+}
+
+function durableVerification(status: "passed" | "failed" | "unknown" = "passed"): TaskRecord["verification"] {
+  return ["npm test", "npm run check", "npm run build"].map((command) => ({
+    command,
+    attempt: 1,
+    startedAt: "2026-06-24T03:00:01.000Z",
+    endedAt: "2026-06-24T03:00:02.000Z",
+    exitCode: status === "passed" ? 0 : status === "failed" ? 1 : null,
+    status,
+    outputRef: "durable-state",
+    isCurrent: true,
+    evidence: {
+      source: "build-worker",
+      taskId: TASK_ID,
+      executionRoot: "durable-test-root",
+      expectedCommands: ["npm test", "npm run check", "npm run build"],
+      outputRef: "durable-state",
+      recordedAt: "2026-06-24T03:00:02.000Z",
+      explanation: "Persisted by build worker."
+    }
+  }));
 }
 
 function approvalReviewReport(): string {

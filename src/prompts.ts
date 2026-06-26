@@ -26,7 +26,8 @@ ${criteria}
 `;
 }
 
-export function buildPrompt(taskId: string): string {
+export function buildPrompt(taskId: string, options: { executionRoot?: string; configuredCommands?: string[] } = {}): string {
+  const commands = (options.configuredCommands ?? []).map((command) => `  - \`${command}\``).join("\n");
   return `You are Codex running under Project Pilot for task ${taskId}.
 
 Read AGENTS.md first if present, then read TASK.md. Implement only the task described in TASK.md.
@@ -36,8 +37,11 @@ Required behavior:
 - Do not deploy, push, merge, commit, delete unrelated files, or request credentials.
 - Make the smallest coherent code changes needed for the task.
 - Run relevant tests, lint, and build commands available in the project.
+- Treat these configured verification commands as required when present:
+${commands || "  - No configured commands were provided by the controller."}
 - Write BUILD_REPORT.md with:
   - Task ID
+  - Execution Root: ${options.executionRoot ?? "current working directory"}
   - Summary of changes
   - Files changed
   - Commands run and results
