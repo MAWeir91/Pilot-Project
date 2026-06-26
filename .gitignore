@@ -1,9 +1,14 @@
+﻿# Local secrets and machine-specific settings
 .env
 .env.*
 !.env.example
 
+# Dependencies and generated output
 node_modules/
+dist/
+coverage/
 
+# Runtime state, logs, and backups
 data/*
 !data/.gitkeep
 data-backup-*/
