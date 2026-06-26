@@ -1,5 +1,6 @@
 import path from "node:path";
 import { DurableJsonFile } from "./durable-json.js";
+import { validateMaintenanceExecutionConfig } from "./execution.js";
 import { ALLOWLISTED_PROJECT_ROOT, PROJECTS_FILE, assertAllowedPath } from "./paths.js";
 export const DEFAULT_PROJECT_ID = "trade-journal-lite";
 export class ProjectRegistry {
@@ -73,6 +74,29 @@ export class ProjectRegistry {
             return project;
         });
     }
+    async configureMaintenanceExecution(input, runner) {
+        const projectId = assertProjectId(input.projectId);
+        let preflight;
+        const project = await this.file.update((state) => {
+            const existingIndex = state.projects.findIndex((candidate) => candidate.id === projectId);
+            if (existingIndex < 0) {
+                throw new Error(`Unknown projectId: ${projectId}`);
+            }
+            const existing = normalizeProject(state.projects[existingIndex]);
+            const validated = validateMaintenanceExecutionConfig(existing, input, runner);
+            preflight = validated.preflight;
+            const updated = {
+                ...existing,
+                path: path.resolve(existing.path),
+                executionRoot: validated.executionRoot,
+                maintenance: validated.maintenance,
+                updatedAt: this.now()
+            };
+            state.projects[existingIndex] = updated;
+            return updated;
+        });
+        return { project, preflight: preflight };
+    }
     defaultState() {
         const now = this.now();
         return {
@@ -133,7 +157,8 @@ function normalizeProject(project) {
             ? {
                 ...project.maintenance,
                 liveRoot: path.resolve(project.maintenance.liveRoot),
-                baseBranch: requiredText(project.maintenance.baseBranch, "maintenance.baseBranch")
+                baseBranch: optionalText(project.maintenance.baseBranch) ?? "",
+                expectedBranch: optionalText(project.maintenance.expectedBranch) ?? ""
             }
             : undefined
     };
@@ -175,6 +200,7 @@ function normalizeMaintenanceConfig(maintenance, projectPath, defaultBranchName)
     }
     const liveRoot = maintenance.liveRoot ? optionalAbsolutePath(maintenance.liveRoot, "maintenance.liveRoot") : projectPath;
     const baseBranch = requiredText(maintenance.baseBranch ?? defaultBranchName, "maintenance.baseBranch");
+    const expectedBranch = requiredText(maintenance.expectedBranch ?? baseBranch, "maintenance.expectedBranch");
     const dirtyWorkingTreeReason = optionalText(maintenance.dirtyWorkingTreeReason);
     if (maintenance.allowDirtyWorkingTree && !dirtyWorkingTreeReason) {
         throw new Error("maintenance.dirtyWorkingTreeReason is required when allowDirtyWorkingTree is true.");
@@ -183,6 +209,7 @@ function normalizeMaintenanceConfig(maintenance, projectPath, defaultBranchName)
         enabled: true,
         liveRoot,
         baseBranch,
+        expectedBranch,
         ...(maintenance.allowDirtyWorkingTree ? { allowDirtyWorkingTree: true, dirtyWorkingTreeReason } : {})
     };
 }

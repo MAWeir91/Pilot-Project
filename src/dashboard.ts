@@ -298,11 +298,31 @@ export function renderDashboardHtml(): string {
 
     function renderConfiguration(configuration) {
       const configured = configuration.managerModeConfigured ? "configured" : "not configured";
+      const projectRows = Array.isArray(configuration.projects)
+        ? configuration.projects.map((project) => {
+          const maintenance = project.maintenance || {};
+          const preflight = maintenance.preflight || {};
+          return '<tr>' +
+            '<td>' + escapeHtml(project.projectName || project.projectId) + '<div class="muted mono">' + escapeHtml(project.projectId) + '</div></td>' +
+            '<td>' + escapeHtml(maintenance.enabled ? "enabled" : "disabled") + '</td>' +
+            '<td class="mono">' + escapeHtml(text(maintenance.liveRoot)) + '</td>' +
+            '<td class="mono">' + escapeHtml(text(maintenance.executionRoot)) + '</td>' +
+            '<td>' + escapeHtml(text(maintenance.expectedBranch)) + '<div class="muted">base: ' + escapeHtml(text(maintenance.baseBranch)) + '</div></td>' +
+            '<td>' + escapeHtml(preflight.ok ? "passed" : "blocked") + '<div class="muted preview">' + escapeHtml(text(maintenance.cannotStartReason)) + '</div></td>' +
+          '</tr>';
+        }).join("")
+        : "";
       return '<section><h3>Manager Mode</h3><table><tbody>' +
         '<tr><th>Configuration</th><td>' + escapeHtml(configured) + '</td><th>Manager Model</th><td>' + escapeHtml(configuration.managerModel) + '</td></tr>' +
         '<tr><th>Decision Limit</th><td>' + escapeHtml(configuration.maxManagerDecisionsPerRun) + '</td><th>Task Limit</th><td>' + escapeHtml(configuration.maxTasksPerRun) + '</td></tr>' +
         '<tr><th>Fix Limit</th><td>' + escapeHtml(configuration.maxFixAttemptsPerTask) + '</td><th>Runtime Limit</th><td>' + escapeHtml(configuration.maxManagerRuntimeMs) + ' ms</td></tr>' +
-      '</tbody></table></section>';
+      '</tbody></table>' +
+      (projectRows
+        ? '<h3>Maintenance Execution</h3><table><thead><tr>' +
+          ["Project", "Mode", "Live Root", "Execution Root", "Expected Branch", "Preflight"].map((field) => '<th>' + escapeHtml(field) + '</th>').join("") +
+          '</tr></thead><tbody>' + projectRows + '</tbody></table>'
+        : "") +
+      '</section>';
     }
 
     function renderStateHealth(stateHealth) {

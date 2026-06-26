@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { buildReportFile } from "./paths.js";
+import { maintenanceStatus, taskArtifactRoot } from "./execution.js";
 import { readLogTail, readTextIfExists } from "./logs.js";
 import { StateStore } from "./state.js";
 import { deriveTaskStatus } from "./task-status.js";
@@ -9,14 +10,17 @@ export async function getProjectStatus(store = new StateStore(), projects = new 
     const latestTask = await store.latestTask();
     const taskProjectId = latestTask?.projectId ?? DEFAULT_PROJECT_ID;
     const statusProject = latestTask && taskProjectId !== activeProject.id ? await projects.getProject(taskProjectId) : activeProject;
-    const buildReport = await readTextIfExists(buildReportFile(statusProject.path));
-    const git = getGitStatus(statusProject.path);
+    const artifactRoot = taskArtifactRoot(statusProject);
+    const buildReport = await readTextIfExists(buildReportFile(artifactRoot));
+    const git = getGitStatus(artifactRoot);
     const latestTaskStatus = latestTask ? deriveTaskStatus(latestTask) : undefined;
     return {
         projectId: statusProject.id,
         projectName: statusProject.name,
         projectRoot: statusProject.path,
+        executionRoot: artifactRoot,
         activeProjectId: activeProject.id,
+        maintenance: maintenanceStatus(statusProject),
         currentTaskStatus: latestTask
             ? {
                 taskId: latestTask.id,

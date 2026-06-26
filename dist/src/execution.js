@@ -2,10 +2,11 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { PROJECT_PILOT_LIVE_ROOT, assertAllowedPath, isPathInsideRoot } from "./paths.js";
+const CANONICAL_PROJECT_PILOT_LIVE_ROOT = canonicalPath(PROJECT_PILOT_LIVE_ROOT);
 export function projectExecutionContext(project) {
     return {
-        registeredRoot: path.resolve(project.path),
-        executionRoot: path.resolve(project.executionRoot ?? project.path),
+        registeredRoot: canonicalPath(project.path),
+        executionRoot: canonicalPath(project.executionRoot ?? project.path),
         maintenanceMode: project.maintenance?.enabled === true
     };
 }
@@ -31,12 +32,29 @@ export function preflightWorkerLaunch(project, runner = runGit) {
         executionRoot: context.executionRoot
     };
     if (!context.maintenanceMode) {
+        if (context.registeredRoot === CANONICAL_PROJECT_PILOT_LIVE_ROOT) {
+            return {
+                ok: false,
+                executionRoot: context.executionRoot,
+                reason: "Maintenance configuration is required for the live Project Pilot checkout.",
+                diagnostics: {
+                    ...diagnostics,
+                    liveRoot: CANONICAL_PROJECT_PILOT_LIVE_ROOT
+                }
+            };
+        }
         return { ok: true, executionRoot: context.executionRoot, diagnostics };
     }
-    const liveRoot = path.resolve(project.maintenance?.liveRoot ?? PROJECT_PILOT_LIVE_ROOT);
-    const baseBranch = project.maintenance?.baseBranch || project.defaultBranchName;
+    const configError = validatePersistedMaintenanceConfig(project);
+    if (configError) {
+        return { ok: false, executionRoot: context.executionRoot, reason: configError, diagnostics };
+    }
+    const liveRoot = canonicalPath(project.maintenance?.liveRoot ?? PROJECT_PILOT_LIVE_ROOT);
+    const baseBranch = project.maintenance.baseBranch;
+    const expectedBranch = project.maintenance.expectedBranch;
     diagnostics.liveRoot = liveRoot;
     diagnostics.baseBranch = baseBranch;
+    diagnostics.expectedBranch = expectedBranch;
     const structuralError = validateMaintenanceRoots(context, liveRoot);
     if (structuralError) {
         return { ok: false, executionRoot: context.executionRoot, reason: structuralError, diagnostics };
@@ -56,6 +74,14 @@ export function preflightWorkerLaunch(project, runner = runGit) {
         diagnostics.currentBranch = branch || "(detached)";
         if (!branch) {
             return { ok: false, executionRoot: context.executionRoot, reason: "Maintenance worktree is in detached HEAD state.", diagnostics };
+        }
+        if (branch !== expectedBranch) {
+            return {
+                ok: false,
+                executionRoot: context.executionRoot,
+                reason: `Maintenance worktree is on branch ${branch}; expected ${expectedBranch}.`,
+                diagnostics
+            };
         }
         const baseRef = resolveBaseRef(project, baseBranch, runner, context.executionRoot);
         diagnostics.baseRef = baseRef;
@@ -98,6 +124,80 @@ export function preflightWorkerLaunch(project, runner = runGit) {
             diagnostics
         };
     }
+}
+export function validateMaintenanceExecutionConfig(project, input, runner = runGit) {
+    assertNoSecrets(input);
+    if (!input.enabled) {
+        return {
+            executionRoot: undefined,
+            maintenance: undefined,
+            preflight: {
+                ok: true,
+                executionRoot: canonicalPath(project.path),
+                diagnostics: {
+                    projectId: project.id,
+                    maintenanceMode: false,
+                    registeredRoot: canonicalPath(project.path),
+                    executionRoot: canonicalPath(project.path)
+                }
+            }
+        };
+    }
+    const registeredRoot = canonicalExistingDirectory(project.path, "registered root");
+    const liveRoot = canonicalExistingDirectory(requiredString(input.liveRoot, "maintenance.liveRoot"), "maintenance.liveRoot");
+    const executionRoot = canonicalExistingDirectory(requiredString(input.executionRoot, "executionRoot"), "executionRoot");
+    const baseBranch = requiredString(input.baseBranch, "maintenance.baseBranch");
+    const expectedBranch = requiredString(input.expectedBranch, "maintenance.expectedBranch");
+    const dirtyWorkingTreeReason = optionalString(input.dirtyWorkingTreeReason);
+    if (input.allowDirtyWorkingTree && !dirtyWorkingTreeReason) {
+        throw new Error("maintenance.dirtyWorkingTreeReason is required when allowDirtyWorkingTree is true.");
+    }
+    if (registeredRoot !== liveRoot) {
+        throw new Error("Registered project root and maintenance.liveRoot must resolve to the same canonical path.");
+    }
+    const candidate = {
+        ...project,
+        path: registeredRoot,
+        executionRoot,
+        maintenance: {
+            enabled: true,
+            liveRoot,
+            baseBranch,
+            expectedBranch,
+            ...(input.allowDirtyWorkingTree ? { allowDirtyWorkingTree: true, dirtyWorkingTreeReason } : {})
+        }
+    };
+    const preflight = preflightWorkerLaunch(candidate, runner);
+    if (!preflight.ok) {
+        throw new Error(preflight.reason ?? "Maintenance Git preflight failed.");
+    }
+    return { executionRoot, maintenance: candidate.maintenance, preflight };
+}
+export function maintenanceStatus(project, runner = runGit) {
+    const preflight = preflightWorkerLaunch(project, runner);
+    const maintenance = project.maintenance?.enabled
+        ? {
+            enabled: true,
+            liveRoot: redactSensitiveText(canonicalPath(project.maintenance.liveRoot)),
+            executionRoot: redactSensitiveText(canonicalPath(project.executionRoot ?? project.path)),
+            baseBranch: redactSensitiveText(project.maintenance.baseBranch),
+            expectedBranch: redactSensitiveText(project.maintenance.expectedBranch),
+            allowDirtyWorkingTree: project.maintenance.allowDirtyWorkingTree === true
+        }
+        : {
+            enabled: false,
+            liveRoot: redactSensitiveText(canonicalPath(project.path)),
+            executionRoot: redactSensitiveText(canonicalPath(project.executionRoot ?? project.path)),
+            baseBranch: redactSensitiveText(project.defaultBranchName),
+            expectedBranch: null,
+            allowDirtyWorkingTree: false
+        };
+    return {
+        ...maintenance,
+        preflight: sanitizePreflight(preflight),
+        canStart: preflight.ok,
+        cannotStartReason: preflight.ok ? null : preflight.reason
+    };
 }
 function validateMaintenanceRoots(context, liveRoot) {
     if (!fs.existsSync(context.executionRoot) || !fs.statSync(context.executionRoot).isDirectory()) {
@@ -148,6 +248,94 @@ function runGit(args, cwd) {
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true
     });
+}
+function validatePersistedMaintenanceConfig(project) {
+    const config = project.maintenance;
+    if (!config?.enabled) {
+        return undefined;
+    }
+    if (!project.executionRoot) {
+        return "Maintenance executionRoot is not configured.";
+    }
+    if (!config.liveRoot) {
+        return "maintenance.liveRoot is not configured.";
+    }
+    if (!config.baseBranch) {
+        return "maintenance.baseBranch is not configured.";
+    }
+    if (!config.expectedBranch) {
+        return "maintenance.expectedBranch is not configured.";
+    }
+    return undefined;
+}
+function canonicalExistingDirectory(value, field) {
+    const resolved = path.resolve(value);
+    if (!path.isAbsolute(value)) {
+        throw new Error(`${field} must be absolute.`);
+    }
+    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
+        throw new Error(`${field} is missing or not a directory: ${resolved}.`);
+    }
+    return canonicalPath(resolved);
+}
+function canonicalPath(value) {
+    const resolved = path.resolve(value);
+    try {
+        return fs.realpathSync.native(resolved);
+    }
+    catch {
+        return resolved;
+    }
+}
+function requiredString(value, field) {
+    const trimmed = value?.trim();
+    if (!trimmed) {
+        throw new Error(`${field} is required.`);
+    }
+    if (!path.isAbsolute(trimmed) && /Root$/i.test(field)) {
+        throw new Error(`${field} must be absolute.`);
+    }
+    if (containsSecret(trimmed)) {
+        throw new Error(`${field} must not contain secrets or API tokens.`);
+    }
+    return trimmed;
+}
+function optionalString(value) {
+    const trimmed = value?.trim();
+    if (!trimmed) {
+        return undefined;
+    }
+    if (containsSecret(trimmed)) {
+        throw new Error("maintenance configuration must not contain secrets or API tokens.");
+    }
+    return trimmed;
+}
+function assertNoSecrets(input) {
+    for (const [key, value] of Object.entries(input)) {
+        if (typeof value === "string" && containsSecret(value)) {
+            throw new Error(`${key} must not contain secrets or API tokens.`);
+        }
+    }
+}
+function sanitizePreflight(preflight) {
+    const diagnostics = {};
+    for (const [key, value] of Object.entries(preflight.diagnostics)) {
+        diagnostics[key] = typeof value === "string" ? redactSensitiveText(value) : value;
+    }
+    return {
+        ...preflight,
+        executionRoot: redactSensitiveText(preflight.executionRoot),
+        reason: preflight.reason ? redactSensitiveText(preflight.reason) : undefined,
+        diagnostics
+    };
+}
+function containsSecret(value) {
+    return /\bsk-[A-Za-z0-9_-]{8,}\b/.test(value) || /\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\b/.test(value);
+}
+function redactSensitiveText(text) {
+    return text
+        .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "[REDACTED_OPENAI_KEY]")
+        .replace(/\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\b/g, "[REDACTED_TOKEN]");
 }
 function errorMessage(error) {
     return error instanceof Error ? error.message : String(error);

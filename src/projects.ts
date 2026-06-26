@@ -1,5 +1,11 @@
 import path from "node:path";
 import { DurableJsonFile } from "./durable-json.js";
+import {
+  validateMaintenanceExecutionConfig,
+  type GitCommandRunner,
+  type GitPreflightResult,
+  type MaintenanceExecutionInput
+} from "./execution.js";
 import { ALLOWLISTED_PROJECT_ROOT, PROJECTS_FILE, assertAllowedPath } from "./paths.js";
 import type { ProjectMaintenanceConfig, ProjectRecord, ProjectRegistryState } from "./types.js";
 
@@ -17,6 +23,10 @@ export interface RegisterProjectInput {
   defaultBranchName: string;
   allowedGitBehavior: string;
   maintenance?: Partial<ProjectMaintenanceConfig> & Pick<ProjectMaintenanceConfig, "enabled">;
+}
+
+export interface MaintenanceExecutionUpdateInput extends MaintenanceExecutionInput {
+  projectId: string;
 }
 
 export class ProjectRegistry {
@@ -98,6 +108,33 @@ export class ProjectRegistry {
     });
   }
 
+  async configureMaintenanceExecution(
+    input: MaintenanceExecutionUpdateInput,
+    runner?: GitCommandRunner
+  ): Promise<{ project: ProjectRecord; preflight: GitPreflightResult }> {
+    const projectId = assertProjectId(input.projectId);
+    let preflight: GitPreflightResult | undefined;
+    const project = await this.file.update((state) => {
+      const existingIndex = state.projects.findIndex((candidate) => candidate.id === projectId);
+      if (existingIndex < 0) {
+        throw new Error(`Unknown projectId: ${projectId}`);
+      }
+      const existing = normalizeProject(state.projects[existingIndex]);
+      const validated = validateMaintenanceExecutionConfig(existing, input, runner);
+      preflight = validated.preflight;
+      const updated: ProjectRecord = {
+        ...existing,
+        path: path.resolve(existing.path),
+        executionRoot: validated.executionRoot,
+        maintenance: validated.maintenance,
+        updatedAt: this.now()
+      };
+      state.projects[existingIndex] = updated;
+      return updated;
+    });
+    return { project, preflight: preflight! };
+  }
+
   private defaultState(): ProjectRegistryState {
     const now = this.now();
     return {
@@ -162,7 +199,8 @@ function normalizeProject(project: ProjectRecord): ProjectRecord {
       ? {
           ...project.maintenance,
           liveRoot: path.resolve(project.maintenance.liveRoot),
-          baseBranch: requiredText(project.maintenance.baseBranch, "maintenance.baseBranch")
+          baseBranch: optionalText(project.maintenance.baseBranch) ?? "",
+          expectedBranch: optionalText(project.maintenance.expectedBranch) ?? ""
         }
       : undefined
   };
@@ -215,6 +253,7 @@ function normalizeMaintenanceConfig(
 
   const liveRoot = maintenance.liveRoot ? optionalAbsolutePath(maintenance.liveRoot, "maintenance.liveRoot")! : projectPath;
   const baseBranch = requiredText(maintenance.baseBranch ?? defaultBranchName, "maintenance.baseBranch");
+  const expectedBranch = requiredText(maintenance.expectedBranch ?? baseBranch, "maintenance.expectedBranch");
   const dirtyWorkingTreeReason = optionalText(maintenance.dirtyWorkingTreeReason);
   if (maintenance.allowDirtyWorkingTree && !dirtyWorkingTreeReason) {
     throw new Error("maintenance.dirtyWorkingTreeReason is required when allowDirtyWorkingTree is true.");
@@ -224,6 +263,7 @@ function normalizeMaintenanceConfig(
     enabled: true,
     liveRoot,
     baseBranch,
+    expectedBranch,
     ...(maintenance.allowDirtyWorkingTree ? { allowDirtyWorkingTree: true, dirtyWorkingTreeReason } : {})
   };
 }

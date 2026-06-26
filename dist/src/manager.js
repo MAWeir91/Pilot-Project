@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as z from "zod/v4";
 import { evaluateApprovalPolicy } from "./approval-policy.js";
 import { buildReportFile, reviewReportFile } from "./paths.js";
-import { taskArtifactRoot } from "./execution.js";
+import { maintenanceStatus, taskArtifactRoot } from "./execution.js";
 import { ProjectRegistry } from "./projects.js";
 import { StateStore } from "./state.js";
 import { deriveTaskStatus } from "./task-status.js";
@@ -214,8 +214,16 @@ export class AutopilotService {
         this.autoSchedule = options.autoSchedule ?? true;
         this.processExists = options.processExists ?? defaultProcessExists;
     }
-    configurationStatus() {
-        return managerConfigurationStatus(this.config);
+    async configurationStatus() {
+        const projectState = await this.projects.listProjects();
+        return {
+            ...managerConfigurationStatus(this.config),
+            projects: projectState.projects.map((project) => ({
+                projectId: project.id,
+                projectName: project.name,
+                maintenance: maintenanceStatus(project)
+            }))
+        };
     }
     async createProjectBrief(input) {
         await this.projects.getProject(input.projectId);
@@ -246,6 +254,10 @@ export class AutopilotService {
         const project = input.projectId ? await this.projects.getProject(input.projectId) : await this.projects.getActiveProject();
         if (brief.projectId !== project.id) {
             throw new Error(`Brief ${brief.id} belongs to project ${brief.projectId}, not ${project.id}.`);
+        }
+        const preflight = this.preflightProject(project);
+        if (!preflight.ok) {
+            throw new Error(`Cannot start Autopilot until maintenance Git preflight passes: ${preflight.reason ?? "Git preflight failed."}`);
         }
         const now = this.now();
         const run = {
@@ -623,6 +635,11 @@ export class AutopilotService {
         }
         if (status === "build-passed" && !reconciled.review) {
             const project = await this.projects.getProject(run.projectId);
+            const preflight = this.preflightProject(project);
+            if (!preflight.ok) {
+                await this.pauseFor(run.id, preflight.reason ?? "Maintenance Git preflight failed.", "blocked");
+                return false;
+            }
             const lease = createWorkerLease({
                 runId: run.id,
                 taskId: reconciled.id,
@@ -713,6 +730,11 @@ export class AutopilotService {
             case "create_plan":
             case "revise_plan": {
                 try {
+                    const preflight = this.preflightProject(project);
+                    if (!preflight.ok) {
+                        await this.pauseFor(runId, preflight.reason ?? "Maintenance Git preflight failed.", "blocked");
+                        return;
+                    }
                     const consultation = await this.architect.consult({
                         projectRoot: taskArtifactRoot(project),
                         threadId: run.codexThreads.architectThreadId,
@@ -907,6 +929,13 @@ export class AutopilotService {
         await this.startQueuedTask(runId, projectId, next);
         return true;
     }
+    preflightProject(project) {
+        const preflightRunner = this.jobs;
+        if (typeof preflightRunner.preflightWorkerLaunch === "function") {
+            return preflightRunner.preflightWorkerLaunch(project);
+        }
+        return { ok: true, diagnostics: { projectId: project.id, maintenanceMode: project.maintenance?.enabled === true } };
+    }
     async startQueuedTask(runId, projectId, next) {
         const run = await this.requireRun(runId);
         if (run.currentTaskId) {
@@ -931,22 +960,19 @@ export class AutopilotService {
             acceptanceCriteria: next.acceptanceCriteria
         };
         const project = await this.projects.getProject(projectId);
-        const preflightRunner = this.jobs;
-        if (typeof preflightRunner.preflightWorkerLaunch === "function") {
-            const preflight = preflightRunner.preflightWorkerLaunch(project);
-            if (!preflight.ok) {
-                await this.updateRun(runId, (existing) => ({
-                    ...existing,
-                    scheduler: {
-                        ...(existing.scheduler ?? {}),
-                        dispatchStatus: "maintenance-preflight-blocked",
-                        lastDispatchOutcome: preflight.reason ?? "Maintenance Git preflight failed."
-                    },
-                    timeline: appendTimeline(existing, this.now(), "status", `Maintenance worker launch blocked: ${preflight.reason ?? "Git preflight failed."}`, { diagnostics: preflight.diagnostics })
-                }));
-                await this.pauseFor(runId, preflight.reason ?? "Maintenance Git preflight failed.", "blocked");
-                return;
-            }
+        const preflight = this.preflightProject(project);
+        if (!preflight.ok) {
+            await this.updateRun(runId, (existing) => ({
+                ...existing,
+                scheduler: {
+                    ...(existing.scheduler ?? {}),
+                    dispatchStatus: "maintenance-preflight-blocked",
+                    lastDispatchOutcome: preflight.reason ?? "Maintenance Git preflight failed."
+                },
+                timeline: appendTimeline(existing, this.now(), "status", `Maintenance worker launch blocked: ${preflight.reason ?? "Git preflight failed."}`, { diagnostics: preflight.diagnostics })
+            }));
+            await this.pauseFor(runId, preflight.reason ?? "Maintenance Git preflight failed.", "blocked");
+            return;
         }
         const preparedStarter = this.jobs;
         if (typeof preparedStarter.prepareBuild === "function" && typeof preparedStarter.launchPreparedBuild === "function") {

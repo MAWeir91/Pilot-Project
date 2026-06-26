@@ -117,6 +117,7 @@ describe("MCP server connector metadata", () => {
             "list_projects",
             "get_project",
             "register_project",
+            "configure_maintenance_execution",
             "set_active_project",
             "get_active_project",
             "start_plan",

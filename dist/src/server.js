@@ -268,6 +268,28 @@ export function createServer() {
             securitySchemes: NOAUTH_SECURITY_SCHEMES
         }
     }, async (input) => jsonToolResult(await jobs.registerProject(input)));
+    server.registerTool("configure_maintenance_execution", {
+        title: "Configure Maintenance Execution",
+        description: "Configure and validate maintenance execution for a registered project. Enabled maintenance requires an isolated Git worktree on the expected branch before saving.",
+        inputSchema: {
+            projectId: z.string().trim().min(1).max(80),
+            enabled: z.boolean(),
+            liveRoot: z.string().trim().min(1).max(1_000).optional(),
+            executionRoot: z.string().trim().min(1).max(1_000).optional(),
+            baseBranch: z.string().trim().min(1).max(120).optional(),
+            expectedBranch: z.string().trim().min(1).max(120).optional(),
+            allowDirtyWorkingTree: z.boolean().optional(),
+            dirtyWorkingTreeReason: z.string().trim().min(1).max(2_000).optional()
+        },
+        annotations: {
+            readOnlyHint: false,
+            destructiveHint: false,
+            openWorldHint: false
+        },
+        _meta: {
+            securitySchemes: NOAUTH_SECURITY_SCHEMES
+        }
+    }, async (input) => jsonToolResult(await jobs.configureMaintenanceExecution(input)));
     server.registerTool("set_active_project", {
         title: "Set Active Project",
         description: "Set the default registered project used by Project Pilot.",
@@ -586,8 +608,8 @@ export function createApp(jobService = jobs, autopilotService = autopilot, state
             res.status(message.includes("Unknown planId") ? 404 : 400).json({ error: message });
         }
     });
-    app.get("/dashboard/configuration", (_req, res) => {
-        res.json(autopilotService.configurationStatus());
+    app.get("/dashboard/configuration", async (_req, res) => {
+        res.json(await autopilotService.configurationStatus());
     });
     app.get("/dashboard/state-health", async (_req, res) => {
         try {

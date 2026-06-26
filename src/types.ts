@@ -107,6 +107,7 @@ export interface ProjectMaintenanceConfig {
   enabled: boolean;
   liveRoot: string;
   baseBranch: string;
+  expectedBranch: string;
   allowDirtyWorkingTree?: boolean;
   dirtyWorkingTreeReason?: string;
 }

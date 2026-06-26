@@ -4,7 +4,7 @@ import { CODEX_ACCESS_MODE, CODEX_ACCESS_WARNING, CODEX_APPROVAL_POLICY, assertP
 import { readLogTail, readTextIfExists, extractPlanReport, extractReviewReport } from "./logs.js";
 import { buildPrompt, planPrompt, renderTaskMarkdown, reviewPrompt } from "./prompts.js";
 import { StateStore } from "./state.js";
-import { preflightWorkerLaunch, taskArtifactRoot, taskLocalLogPath } from "./execution.js";
+import { maintenanceStatus, preflightWorkerLaunch, taskArtifactRoot, taskLocalLogPath } from "./execution.js";
 import { completeReadyTask, deriveTaskStatus } from "./task-status.js";
 import { WindowsTaskNotifier } from "./notifications.js";
 import { evaluateApprovalPolicy, parseVerificationRecords, projectVerificationCommands } from "./approval-policy.js";
@@ -103,6 +103,14 @@ export class JobService {
     async registerProject(input) {
         return await this.projects.registerProject(input);
     }
+    async configureMaintenanceExecution(input) {
+        const result = await this.projects.configureMaintenanceExecution(input, this.gitRunner);
+        return {
+            project: result.project,
+            maintenance: maintenanceStatus(result.project, this.gitRunner),
+            preflight: result.preflight
+        };
+    }
     async setActiveProject(projectId) {
         return await this.projects.setActiveProject(projectId);
     }
@@ -111,6 +119,9 @@ export class JobService {
     }
     preflightWorkerLaunch(project) {
         return preflightWorkerLaunch(project, this.gitRunner);
+    }
+    maintenanceStatus(project) {
+        return maintenanceStatus(project, this.gitRunner);
     }
     async getBuildStatus(taskId) {
         assertTaskId(taskId);

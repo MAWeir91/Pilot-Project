@@ -3,8 +3,9 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { JobService } from "../src/jobs.js";
+import { AutopilotService, NullAutopilotNotifier } from "../src/manager.js";
 import { NullTaskNotifier } from "../src/notifications.js";
-import { DATA_DIR, dataPath } from "../src/paths.js";
+import { DATA_DIR, PROJECT_PILOT_LIVE_ROOT, dataPath } from "../src/paths.js";
 import { ProjectRegistry } from "../src/projects.js";
 import { StateStore } from "../src/state.js";
 import type { ProjectRecord } from "../src/types.js";
@@ -18,6 +19,59 @@ afterEach(async () => {
 });
 
 describe("maintenance execution isolation", () => {
+  it("persists explicit maintenance configuration and reads it back through project views", async () => {
+    const { service, registry, liveRoot, executionRoot } = await serviceWithPlainProject();
+
+    const configured = await service.configureMaintenanceExecution({
+      projectId: "project-pilot-maintenance",
+      enabled: true,
+      liveRoot,
+      executionRoot,
+      baseBranch: "main",
+      expectedBranch: "feature/self-improvement-dashboard-workflow-v1"
+    });
+    const readback = await registry.getProject("project-pilot-maintenance");
+    const status = service.maintenanceStatus(readback);
+
+    expect(readback.executionRoot).toBe(executionRoot);
+    expect(readback.maintenance).toMatchObject({
+      enabled: true,
+      liveRoot,
+      baseBranch: "main",
+      expectedBranch: "feature/self-improvement-dashboard-workflow-v1"
+    });
+    expect(configured).toMatchObject({ preflight: { ok: true } });
+    expect(status).toMatchObject({
+      enabled: true,
+      liveRoot,
+      executionRoot,
+      expectedBranch: "feature/self-improvement-dashboard-workflow-v1",
+      canStart: true,
+      cannotStartReason: null
+    });
+  });
+
+  it("accepts a valid isolated worktree only through the dedicated configuration operation", async () => {
+    const { service, registry, executionRoot } = await serviceWithPlainProject();
+
+    await service.configureMaintenanceExecution({
+      projectId: "project-pilot-maintenance",
+      enabled: true,
+      liveRoot: (await registry.getProject("project-pilot-maintenance")).path,
+      executionRoot,
+      baseBranch: "main",
+      expectedBranch: "feature/self-improvement-dashboard-workflow-v1"
+    });
+
+    await expect(registry.getProject("project-pilot-maintenance")).resolves.toMatchObject({
+      executionRoot,
+      maintenance: {
+        enabled: true,
+        expectedBranch: "feature/self-improvement-dashboard-workflow-v1"
+      }
+    });
+  });
+
   it("rejects live-root execution before writing task artifacts or launching a worker", async () => {
     const { service, liveRoot, spawnJob } = await serviceWithMaintenanceProject({ executionRoot: "live" });
 
@@ -28,6 +82,22 @@ describe("maintenance execution isolation", () => {
     expect(spawnJob).not.toHaveBeenCalled();
     expect(tasks.tasks[0]?.buildSummary).toMatch(/distinct from the registered project root/);
     await expectLiveRootUnchanged(liveRoot);
+  });
+
+  it("rejects live-root equivalent maintenance configuration before saving", async () => {
+    const { service, registry, liveRoot } = await serviceWithPlainProject();
+
+    await expect(
+      service.configureMaintenanceExecution({
+        projectId: "project-pilot-maintenance",
+        enabled: true,
+        liveRoot,
+        executionRoot: liveRoot,
+        baseBranch: "main",
+        expectedBranch: "feature/self-improvement-dashboard-workflow-v1"
+      })
+    ).rejects.toThrow(/distinct from the registered project root|live Project Pilot checkout/i);
+    await expect(registry.getProject("project-pilot-maintenance")).resolves.toMatchObject({ maintenance: undefined });
   });
 
   it("routes task artifacts, logs, and Codex execution to a valid isolated worktree", async () => {
@@ -52,11 +122,49 @@ describe("maintenance execution isolation", () => {
     expect(project.executionRoot).toBe(executionRoot);
   });
 
+  it("rejects invalid expected branch and invalid worktree configuration before saving", async () => {
+    const branchMismatch = await serviceWithPlainProject({
+      gitRunner: validMaintenanceGitRunner("wrong-branch")
+    });
+    await expect(
+      branchMismatch.service.configureMaintenanceExecution({
+        projectId: "project-pilot-maintenance",
+        enabled: true,
+        liveRoot: branchMismatch.liveRoot,
+        executionRoot: branchMismatch.executionRoot,
+        baseBranch: "main",
+        expectedBranch: "feature/self-improvement-dashboard-workflow-v1"
+      })
+    ).rejects.toThrow(/expected feature\/self-improvement-dashboard-workflow-v1/);
+
+    const invalidWorktree = await serviceWithPlainProject({
+      gitRunner: (args, cwd) => {
+        if (args[0] === "rev-parse") return `${cwd}\n`;
+        if (args[0] === "branch") return "feature/self-improvement-dashboard-workflow-v1\n";
+        if (args[0] === "show-ref") return "";
+        if (args[0] === "merge-base") return "";
+        if (args[0] === "worktree") return `worktree ${invalidWorktree.liveRoot}\nHEAD abc\n`;
+        if (args[0] === "status") return "";
+        return "";
+      }
+    });
+    await expect(
+      invalidWorktree.service.configureMaintenanceExecution({
+        projectId: "project-pilot-maintenance",
+        enabled: true,
+        liveRoot: invalidWorktree.liveRoot,
+        executionRoot: invalidWorktree.executionRoot,
+        baseBranch: "main",
+        expectedBranch: "feature/self-improvement-dashboard-workflow-v1"
+      })
+    ).rejects.toThrow(/not listed by git worktree/);
+  });
+
   it("blocks invalid Git preflight before worker launch", async () => {
     const { service, executionRoot, liveRoot, spawnJob } = await serviceWithMaintenanceProject({
       gitRunner: (args) => {
         if (args[0] === "rev-parse") return executionRoot;
-        if (args[0] === "branch") return "chore/self-maintenance-bootstrap\n";
+        if (args[0] === "branch") return "feature/self-improvement-dashboard-workflow-v1\n";
         if (args[0] === "show-ref") throw new Error("missing base");
         return "";
       }
@@ -111,6 +219,146 @@ describe("maintenance execution isolation", () => {
     expect(details.errors.join("\n")).toMatch(new RegExp(`Expected ${result.planId}`));
     expect(details.errors.join("\n")).toMatch(new RegExp(`found ${wrongPlanId}`));
   });
+
+  it("refuses Autopilot before worker launch when maintenance config is absent for the live root", async () => {
+    const stateFile = dataPath(`maintenance-autopilot-state-${FILES.length}.json`);
+    const registryFile = dataPath(`maintenance-autopilot-projects-${FILES.length}.json`);
+    FILES.push(stateFile, registryFile);
+    const registry = new ProjectRegistry(registryFile, () => "2026-06-24T05:00:00.000Z");
+    await registry.registerProject({
+      id: "project-pilot-maintenance",
+      name: "Project Pilot Maintenance",
+      path: PROJECT_PILOT_LIVE_ROOT,
+      gitRemoteName: "origin",
+      buildCommand: "npm run build",
+      testCommand: "npm test",
+      checkCommand: "npm run check",
+      defaultBranchName: "main",
+      allowedGitBehavior: "isolated maintenance worktree only"
+    });
+    const store = new StateStore(stateFile);
+    const jobs = new JobService(store, new NullTaskNotifier(), { projects: registry });
+    const autopilot = new AutopilotService({
+      store,
+      projects: registry,
+      jobs,
+      notifier: new NullAutopilotNotifier(),
+      autoSchedule: false,
+      config: {
+        configured: true,
+        managerModel: "test-manager",
+        maxManagerDecisionsPerRun: 1,
+        maxTasksPerRun: 1,
+        maxFixAttemptsPerTask: 0,
+        maxManagerRuntimeMs: 60_000
+      }
+    });
+    const brief = await autopilot.createProjectBrief({
+      projectId: "project-pilot-maintenance",
+      title: "Maintenance brief",
+      productSummary: "Project Pilot",
+      requirements: "Improve Project Pilot.",
+      constraints: "Use isolated worktree.",
+      decisions: [],
+      definitionOfDone: ["No live-root mutation."]
+    });
+
+    await expect(autopilot.startAutopilot({ projectId: "project-pilot-maintenance", briefId: brief.briefId })).rejects.toThrow(
+      /Maintenance configuration is required/
+    );
+    await expect(store.listAutopilotRuns()).resolves.toHaveLength(0);
+  });
+
+  it("routes Autopilot queued work to the configured execution root after valid configuration", async () => {
+    const { service, registry, store, spawnJob, executionRoot } = await serviceWithPlainProject();
+    await service.configureMaintenanceExecution({
+      projectId: "project-pilot-maintenance",
+      enabled: true,
+      liveRoot: (await registry.getProject("project-pilot-maintenance")).path,
+      executionRoot,
+      baseBranch: "main",
+      expectedBranch: "feature/self-improvement-dashboard-workflow-v1"
+    });
+    const autopilot = new AutopilotService({
+      store,
+      projects: registry,
+      jobs: service,
+      manager: {
+        decide: async () => ({
+          action: "create_ordered_tasks",
+          summary: "Queue maintenance task",
+          reason: null,
+          taskId: null,
+          tasks: [taskInput()],
+          fixTask: null
+        })
+      },
+      notifier: new NullAutopilotNotifier(),
+      autoSchedule: false,
+      config: {
+        configured: true,
+        managerModel: "test-manager",
+        maxManagerDecisionsPerRun: 3,
+        maxTasksPerRun: 3,
+        maxFixAttemptsPerTask: 0,
+        maxManagerRuntimeMs: 60_000
+      }
+    });
+    const brief = await autopilot.createProjectBrief({
+      projectId: "project-pilot-maintenance",
+      title: "Maintenance brief",
+      productSummary: "Project Pilot",
+      requirements: "Improve Project Pilot.",
+      constraints: "Use isolated worktree.",
+      decisions: [],
+      definitionOfDone: ["No live-root mutation."]
+    });
+    const run = await autopilot.startAutopilot({ projectId: "project-pilot-maintenance", briefId: brief.briefId });
+
+    await autopilot.tick(run.runId);
+    await autopilot.tick(run.runId);
+    await waitUntil(() => spawnJob.mock.calls.length === 1);
+    await waitUntil(async () => (await store.listTasks()).some((task) => task.build.status === "passed"));
+
+    expect(spawnJob.mock.calls[0][0]).toMatchObject({ projectRoot: executionRoot });
+    const runs = await store.listAutopilotRuns();
+    expect(runs[0]?.workers?.[0]?.reportPath).toBe(path.join(executionRoot, "BUILD_REPORT.md"));
+  });
+
+  it("exposes dashboard-safe maintenance status without leaking secrets", async () => {
+    const { service, registry, executionRoot } = await serviceWithPlainProject();
+    await expect(
+      service.configureMaintenanceExecution({
+        projectId: "project-pilot-maintenance",
+        enabled: true,
+        liveRoot: (await registry.getProject("project-pilot-maintenance")).path,
+        executionRoot,
+        baseBranch: "main",
+        expectedBranch: "feature/self-improvement-dashboard-workflow-v1",
+        allowDirtyWorkingTree: true,
+        dirtyWorkingTreeReason: "sk-secret123456"
+      })
+    ).rejects.toThrow(/must not contain secrets/);
+
+    await service.configureMaintenanceExecution({
+      projectId: "project-pilot-maintenance",
+      enabled: true,
+      liveRoot: (await registry.getProject("project-pilot-maintenance")).path,
+      executionRoot,
+      baseBranch: "main",
+      expectedBranch: "feature/self-improvement-dashboard-workflow-v1"
+    });
+    const status = service.maintenanceStatus(await registry.getProject("project-pilot-maintenance"));
+
+    expect(status).toMatchObject({
+      enabled: true,
+      liveRoot: expect.any(String),
+      executionRoot: expect.any(String),
+      expectedBranch: "feature/self-improvement-dashboard-workflow-v1",
+      canStart: true
+    });
+    expect(JSON.stringify(status)).not.toMatch(/sk-secret|dirtyWorkingTreeReason/);
+  });
 });
 
 async function serviceWithMaintenanceProject(options: {
@@ -145,7 +393,8 @@ async function serviceWithMaintenanceProject(options: {
     maintenance: {
       enabled: true,
       liveRoot,
-      baseBranch: "main"
+      baseBranch: "main",
+      expectedBranch: "feature/self-improvement-dashboard-workflow-v1"
     }
   });
 
@@ -161,7 +410,7 @@ async function serviceWithMaintenanceProject(options: {
     options.gitRunner ??
     ((args: string[], cwd: string) => {
       if (args[0] === "rev-parse") return `${cwd}\n`;
-      if (args[0] === "branch") return "chore/self-maintenance-bootstrap\n";
+      if (args[0] === "branch") return "feature/self-improvement-dashboard-workflow-v1\n";
       if (args[0] === "show-ref") return "";
       if (args[0] === "merge-base") return "";
       if (args[0] === "worktree") return `worktree ${liveRoot}\nHEAD abc\n\nworktree ${executionRoot}\nHEAD def\n`;
@@ -179,6 +428,64 @@ async function serviceWithMaintenanceProject(options: {
   });
 
   return { service, project: project as ProjectRecord, liveRoot, executionRoot, spawnJob, store };
+}
+
+async function serviceWithPlainProject(options: {
+  gitRunner?: (args: string[], cwd: string) => string;
+} = {}) {
+  const index = FILES.length;
+  const stateFile = dataPath(`maintenance-plain-state-${index}.json`);
+  const registryFile = dataPath(`maintenance-plain-projects-${index}.json`);
+  FILES.push(stateFile, registryFile);
+
+  const liveRoot = path.join(DATA_DIR, `maintenance-plain-live-${index}`);
+  const executionRoot = path.join(DATA_DIR, `maintenance-plain-worktree-${index}`);
+  DIRS.push(liveRoot, executionRoot);
+  await fs.mkdir(liveRoot, { recursive: true });
+  await fs.mkdir(executionRoot, { recursive: true });
+
+  const registry = new ProjectRegistry(registryFile, () => "2026-06-24T05:00:00.000Z");
+  await registry.registerProject({
+    id: "project-pilot-maintenance",
+    name: "Project Pilot Maintenance",
+    path: liveRoot,
+    gitRemoteName: "origin",
+    buildCommand: "npm run build",
+    testCommand: "npm test",
+    checkCommand: "npm run check",
+    defaultBranchName: "main",
+    allowedGitBehavior: "isolated maintenance worktree only"
+  });
+
+  const spawnJob = vi.fn((spawnOptions: {
+    prompt: string;
+    onClose?: (exitCode: number | null, signal: NodeJS.Signals | null, stdoutText: string) => void;
+  }) => {
+    setTimeout(() => spawnOptions.onClose?.(0, null, ""), 5);
+    return fakeChild(6262);
+  });
+  const store = new StateStore(stateFile);
+  const service = new JobService(store, new NullTaskNotifier(), {
+    projects: registry,
+    spawnJob,
+    gitRunner: options.gitRunner ?? validMaintenanceGitRunner("feature/self-improvement-dashboard-workflow-v1", liveRoot, executionRoot),
+    processExists: (pid) => pid === 6262,
+    now: () => "2026-06-24T05:10:00.000Z"
+  });
+
+  return { service, registry, liveRoot, executionRoot, spawnJob, store };
+}
+
+function validMaintenanceGitRunner(branch: string, liveRoot?: string, executionRoot?: string) {
+  return (args: string[], cwd: string) => {
+    if (args[0] === "rev-parse") return `${cwd}\n`;
+    if (args[0] === "branch") return `${branch}\n`;
+    if (args[0] === "show-ref") return "";
+    if (args[0] === "merge-base") return "";
+    if (args[0] === "worktree") return `worktree ${liveRoot ?? path.dirname(cwd)}\nHEAD abc\n\nworktree ${executionRoot ?? cwd}\nHEAD def\n`;
+    if (args[0] === "status") return "";
+    return "";
+  };
 }
 
 function taskInput() {

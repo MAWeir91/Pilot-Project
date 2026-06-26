@@ -16,7 +16,14 @@ import {
 import { readLogTail, readTextIfExists, extractPlanReport, extractReviewReport } from "./logs.js";
 import { buildPrompt, planPrompt, renderTaskMarkdown, reviewPrompt } from "./prompts.js";
 import { StateStore } from "./state.js";
-import { preflightWorkerLaunch, taskArtifactRoot, taskLocalLogPath, type GitCommandRunner, type GitPreflightResult } from "./execution.js";
+import {
+  maintenanceStatus,
+  preflightWorkerLaunch,
+  taskArtifactRoot,
+  taskLocalLogPath,
+  type GitCommandRunner,
+  type GitPreflightResult
+} from "./execution.js";
 import { completeReadyTask, deriveTaskStatus } from "./task-status.js";
 import { WindowsTaskNotifier, type TaskNotifier } from "./notifications.js";
 import {
@@ -24,7 +31,7 @@ import {
   parseVerificationRecords,
   projectVerificationCommands
 } from "./approval-policy.js";
-import { DEFAULT_PROJECT_ID, ProjectRegistry, type RegisterProjectInput } from "./projects.js";
+import { DEFAULT_PROJECT_ID, ProjectRegistry, type MaintenanceExecutionUpdateInput, type RegisterProjectInput } from "./projects.js";
 import type {
   JobStatus,
   PlanDetails,
@@ -185,6 +192,15 @@ export class JobService {
     return await this.projects.registerProject(input);
   }
 
+  async configureMaintenanceExecution(input: MaintenanceExecutionUpdateInput): Promise<Record<string, unknown>> {
+    const result = await this.projects.configureMaintenanceExecution(input, this.gitRunner);
+    return {
+      project: result.project,
+      maintenance: maintenanceStatus(result.project, this.gitRunner),
+      preflight: result.preflight
+    };
+  }
+
   async setActiveProject(projectId: string): Promise<ProjectRecord> {
     return await this.projects.setActiveProject(projectId);
   }
@@ -195,6 +211,10 @@ export class JobService {
 
   preflightWorkerLaunch(project: ProjectRecord): GitPreflightResult {
     return preflightWorkerLaunch(project, this.gitRunner);
+  }
+
+  maintenanceStatus(project: ProjectRecord): Record<string, unknown> {
+    return maintenanceStatus(project, this.gitRunner);
   }
 
   async getBuildStatus(taskId: string): Promise<Record<string, unknown>> {
