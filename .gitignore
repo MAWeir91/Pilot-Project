@@ -1,0 +1,22 @@
+node_modules/
+dist/
+coverage/
+data/*.json
+data/*.jsonl
+data/*.log
+!.gitkeep
+.env
+
+# Local secrets and machine-specific settings
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+
+# Runtime state, logs, and backups
+data/*
+!data/.gitkeep
+data-backup-*/
+.git.broken-*/
