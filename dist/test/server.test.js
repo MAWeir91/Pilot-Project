@@ -409,6 +409,11 @@ describe("MCP server connector metadata", () => {
         expect(html).toMatch(/Latest Planning Log Lines/);
         expect(html).toMatch(/Last updated: never/);
         expect(html).toMatch(/Connection issue\. Showing last successful data\./);
+        expect(html).toMatch(/This section is temporarily unavailable/);
+        expect(html).toMatch(/\/dashboard\/core/);
+        expect(html).toMatch(/Promise\.allSettled/);
+        expect(html).toMatch(/AbortController/);
+        expect(html).not.toMatch(/Promise\.all\(\[/);
         expect(html).toMatch(/setInterval\(refresh, 5000\)/);
         expect(html).toMatch(/View details/);
         expect(html).toMatch(/data-approve-task-id/);
@@ -546,6 +551,149 @@ describe("MCP server connector metadata", () => {
         expect(health.filePath).toContain("server-test-tasks.json");
     });
 });
+describe("dashboard bounded read snapshots", () => {
+    const stateFile = dataPath("server-dashboard-large-state.json");
+    const missingLogFile = dataPath("server-dashboard-missing-log.jsonl");
+    afterAll(async () => {
+        await fs.rm(stateFile, { force: true });
+    });
+    it("serves core dashboard endpoints quickly from a bounded snapshot without service side effects or state mutation", async () => {
+        await fs.writeFile(stateFile, `${JSON.stringify(largeDashboardState(missingLogFile), null, 2)}\n`, "utf8");
+        const stateStore = new StateStore(stateFile);
+        const service = new JobService(stateStore, new NullTaskNotifier());
+        const autopilotService = new AutopilotService({
+            store: stateStore,
+            jobs: service,
+            notifier: new NullAutopilotNotifier(),
+            autoSchedule: false,
+            processExists: () => {
+                throw new Error("dashboard reads must not check worker processes");
+            }
+        });
+        const calls = {
+            reconcileTasks: 0,
+            listTasks: 0,
+            listPlans: 0,
+            getTaskDetails: 0,
+            reconcileRuns: 0,
+            listRuns: 0,
+            getRun: 0,
+            configurationStatus: 0
+        };
+        service.reconcileUnfinishedTasks = async () => {
+            calls.reconcileTasks += 1;
+            throw new Error("dashboard reads must not reconcile tasks");
+        };
+        service.listTasks = async () => {
+            calls.listTasks += 1;
+            throw new Error("dashboard reads must not call listTasks");
+        };
+        service.listPlans = async () => {
+            calls.listPlans += 1;
+            throw new Error("dashboard reads must not call listPlans");
+        };
+        service.getTaskDetails = async () => {
+            calls.getTaskDetails += 1;
+            throw new Error("dashboard reads must not call getTaskDetails");
+        };
+        autopilotService.reconcileAndResume = async () => {
+            calls.reconcileRuns += 1;
+            throw new Error("dashboard reads must not reconcile runs");
+        };
+        autopilotService.listAutopilotRuns = async () => {
+            calls.listRuns += 1;
+            throw new Error("dashboard reads must not call listAutopilotRuns");
+        };
+        autopilotService.getAutopilotStatus = async () => {
+            calls.getRun += 1;
+            throw new Error("dashboard reads must not call getAutopilotStatus");
+        };
+        autopilotService.configurationStatus = async () => {
+            calls.configurationStatus += 1;
+            throw new Error("dashboard reads must not call configurationStatus");
+        };
+        const { httpServer, baseUrl } = await listen(createApp(service, autopilotService, stateStore, { reconcileOnStart: false }));
+        try {
+            const before = await fs.readFile(stateFile, "utf8");
+            const tasks = await timedJson(`${baseUrl}/dashboard/tasks`);
+            const plans = await timedJson(`${baseUrl}/dashboard/plans`);
+            const runs = await timedJson(`${baseUrl}/dashboard/autopilot`);
+            const core = await timedJson(`${baseUrl}/dashboard/core`);
+            const configuration = await timedJson(`${baseUrl}/dashboard/configuration`);
+            const readiness = await timedJson(`${baseUrl}/dashboard/readiness`);
+            const after = await fs.readFile(stateFile, "utf8");
+            for (const result of [tasks, plans, runs, core, configuration, readiness]) {
+                expect(result.response.status).toBe(200);
+                expect(result.elapsedMs).toBeLessThan(1500);
+            }
+            expect(tasks.body.tasks?.length).toBe(200);
+            expect(plans.body.plans?.length).toBe(100);
+            expect(runs.body.runs?.length).toBe(100);
+            expect(tasks.body.tasks?.[0]).toMatchObject({
+                taskId: "task-2026-06-26T10-00-00-000Z-current",
+                title: "Current dashboard task",
+                status: "ready-for-approval"
+            });
+            expect(plans.body.plans?.[0]).toMatchObject({
+                planId: "plan-2026-06-26T10-00-00-000Z-current",
+                title: "Current dashboard plan",
+                status: "plan-ready"
+            });
+            expect(runs.body.runs?.[0]).toMatchObject({
+                id: "autopilot-current-dashboard",
+                currentTaskId: "task-2026-06-26T10-00-00-000Z-current",
+                queueStateSummary: expect.stringMatching(/active: 1/)
+            });
+            expect(core.body.tasks?.[0]?.taskId).toBe("task-2026-06-26T10-00-00-000Z-current");
+            expect(core.body.plans?.[0]?.planId).toBe("plan-2026-06-26T10-00-00-000Z-current");
+            expect(core.body.runs?.[0]?.id).toBe("autopilot-current-dashboard");
+            expect(configuration.body.projects?.[0]?.maintenance?.preflight).toMatchObject({
+                skipped: true,
+                reason: "Dashboard configuration reads do not run Git preflight."
+            });
+            expect(readiness.body.components?.map((component) => component.name)).toEqual(expect.arrayContaining(["state-store", "scheduler", "active-run", "configuration"]));
+            expect(after).toBe(before);
+            expect(calls).toEqual({
+                reconcileTasks: 0,
+                listTasks: 0,
+                listPlans: 0,
+                getTaskDetails: 0,
+                reconcileRuns: 0,
+                listRuns: 0,
+                getRun: 0,
+                configurationStatus: 0
+            });
+        }
+        finally {
+            await closeServer(httpServer);
+        }
+    });
+    it("returns a clear timeout error instead of hanging a slow dashboard snapshot", async () => {
+        const stateStore = new StateStore(stateFile);
+        stateStore.read = async () => {
+            await new Promise((resolve) => setTimeout(resolve, 2500));
+            return { tasks: [], plans: [], projectBriefs: [], autopilotRuns: [] };
+        };
+        const service = new JobService(stateStore, new NullTaskNotifier());
+        const autopilotService = new AutopilotService({
+            store: stateStore,
+            jobs: service,
+            notifier: new NullAutopilotNotifier(),
+            autoSchedule: false
+        });
+        const { httpServer, baseUrl } = await listen(createApp(service, autopilotService, stateStore, { reconcileOnStart: false }));
+        try {
+            const result = await timedJson(`${baseUrl}/dashboard/tasks`);
+            expect(result.response.status).toBe(503);
+            expect(result.elapsedMs).toBeGreaterThanOrEqual(1000);
+            expect(result.elapsedMs).toBeLessThan(2200);
+            expect(result.body.error).toMatch(/timed out after 1500 ms/);
+        }
+        finally {
+            await closeServer(httpServer);
+        }
+    });
+});
 function validPlanReport(planId) {
     return `# Plan Report
 
@@ -587,4 +735,248 @@ Run npm test.
 
 No blockers.
 `;
+}
+async function listen(app) {
+    let httpServer;
+    await new Promise((resolve) => {
+        httpServer = app.listen(0, "127.0.0.1", resolve);
+    });
+    const address = httpServer.address();
+    return { httpServer, baseUrl: `http://127.0.0.1:${address.port}` };
+}
+async function closeServer(httpServer) {
+    await new Promise((resolve, reject) => {
+        httpServer.close((error) => {
+            if (error) {
+                reject(error);
+                return;
+            }
+            resolve();
+        });
+    });
+}
+async function timedJson(url) {
+    const startedAt = Date.now();
+    const response = await fetch(url);
+    const body = (await response.json());
+    return {
+        response,
+        body,
+        elapsedMs: Date.now() - startedAt
+    };
+}
+function largeDashboardState(logPath) {
+    const currentTaskId = "task-2026-06-26T10-00-00-000Z-current";
+    const currentPlanId = "plan-2026-06-26T10-00-00-000Z-current";
+    const tasks = [
+        {
+            id: currentTaskId,
+            projectId: "trade-journal-lite",
+            title: "Current dashboard task",
+            requirements: "Keep current dashboard task data visible.",
+            acceptanceCriteria: ["Current task appears first."],
+            status: "ready-for-approval",
+            createdAt: "2026-06-26T10:00:00.000Z",
+            updatedAt: "2026-06-26T10:01:00.000Z",
+            build: {
+                status: "passed",
+                logPath,
+                startedAt: "2026-06-26T10:00:10.000Z",
+                endedAt: "2026-06-26T10:00:20.000Z",
+                exitCode: 0
+            },
+            review: {
+                status: "passed",
+                result: "pass",
+                logPath,
+                startedAt: "2026-06-26T10:00:30.000Z",
+                endedAt: "2026-06-26T10:00:40.000Z"
+            },
+            verification: verificationRecords(currentTaskId)
+        },
+        ...Array.from({ length: 599 }, (_, index) => {
+            const sequence = String(index).padStart(4, "0");
+            const day = String(25 - Math.floor(index / 50)).padStart(2, "0");
+            return {
+                id: `task-2026-06-${day}T09-00-00-000Z-large${sequence}`,
+                projectId: "trade-journal-lite",
+                title: `Historical dashboard task ${sequence}`,
+                requirements: "Historical task retained for dashboard scale testing.",
+                acceptanceCriteria: ["Task remains bounded."],
+                status: "completed",
+                completedAt: `2026-06-${day}T09:02:00.000Z`,
+                createdAt: `2026-06-${day}T09:00:00.000Z`,
+                updatedAt: `2026-06-${day}T09:02:00.000Z`,
+                build: {
+                    status: "passed",
+                    logPath,
+                    endedAt: `2026-06-${day}T09:01:00.000Z`,
+                    exitCode: 0
+                },
+                review: {
+                    status: "passed",
+                    result: "pass",
+                    logPath,
+                    endedAt: `2026-06-${day}T09:02:00.000Z`
+                }
+            };
+        })
+    ];
+    const plans = [
+        {
+            id: currentPlanId,
+            projectId: "trade-journal-lite",
+            title: "Current dashboard plan",
+            requirements: "Keep current plan visible.",
+            constraints: "Read-only.",
+            status: "plan-ready",
+            createdAt: "2026-06-26T10:00:00.000Z",
+            updatedAt: "2026-06-26T10:01:00.000Z",
+            logPath,
+            reportPath: logPath,
+            startedAt: "2026-06-26T10:00:00.000Z",
+            endedAt: "2026-06-26T10:01:00.000Z",
+            exitCode: 0
+        },
+        ...Array.from({ length: 149 }, (_, index) => {
+            const sequence = String(index).padStart(4, "0");
+            return {
+                id: `plan-2026-06-25T09-00-00-000Z-large${sequence}`,
+                projectId: "trade-journal-lite",
+                title: `Historical dashboard plan ${sequence}`,
+                requirements: "Historical plan retained for dashboard scale testing.",
+                constraints: "Read-only.",
+                status: "plan-ready",
+                createdAt: "2026-06-25T09:00:00.000Z",
+                updatedAt: "2026-06-25T09:01:00.000Z",
+                logPath,
+                reportPath: logPath,
+                endedAt: "2026-06-25T09:01:00.000Z",
+                exitCode: 0
+            };
+        })
+    ];
+    const autopilotRuns = [
+        {
+            id: "autopilot-current-dashboard",
+            projectId: "trade-journal-lite",
+            briefId: "brief-current-dashboard",
+            planId: currentPlanId,
+            status: "running",
+            phase: "building",
+            createdAt: "2026-06-26T10:00:00.000Z",
+            updatedAt: "2026-06-26T10:01:00.000Z",
+            startedAt: "2026-06-26T10:00:00.000Z",
+            currentTaskId,
+            activeRuntimeMs: 1000,
+            nextAction: "start_next_task",
+            decisionsUsed: 1,
+            tasksStarted: 1,
+            fixAttemptsByTaskId: {},
+            recoveryAttemptsByTaskId: {},
+            queue: [
+                {
+                    id: "queue-current-dashboard",
+                    title: "Current dashboard task",
+                    requirements: "Do not expose raw queue requirements.",
+                    acceptanceCriteria: ["Queue state is visible."],
+                    source: "manager",
+                    taskId: currentTaskId,
+                    status: "active",
+                    createdAt: "2026-06-26T10:00:00.000Z",
+                    updatedAt: "2026-06-26T10:01:00.000Z"
+                }
+            ],
+            decisions: [
+                {
+                    at: "2026-06-26T10:00:00.000Z",
+                    action: "start_next_task",
+                    summary: "Start the current dashboard task."
+                }
+            ],
+            timeline: [{ at: "2026-06-26T10:00:00.000Z", kind: "status", summary: "Autopilot run started." }],
+            codexThreads: {},
+            limits: {
+                maxManagerDecisions: 12,
+                maxTasks: 8,
+                maxFixAttemptsPerTask: 1,
+                maxRuntimeMs: 60000
+            },
+            scheduler: {
+                dispatchStatus: "running",
+                lastTickAt: "2026-06-26T10:01:00.000Z"
+            },
+            workers: [
+                {
+                    id: "lease-current-dashboard",
+                    runId: "autopilot-current-dashboard",
+                    taskId: currentTaskId,
+                    phase: "build",
+                    pid: 999999,
+                    command: "codex build worker",
+                    startedAt: "2026-06-26T10:00:10.000Z",
+                    attemptType: "manager",
+                    reportPath: "BUILD_REPORT.md",
+                    expectedArtifact: "BUILD_REPORT.md",
+                    logPath,
+                    lastActivityAt: "2026-06-26T10:01:00.000Z",
+                    status: "active"
+                }
+            ]
+        },
+        ...Array.from({ length: 119 }, (_, index) => {
+            const sequence = String(index).padStart(4, "0");
+            return {
+                id: `autopilot-historical-dashboard-${sequence}`,
+                projectId: "trade-journal-lite",
+                briefId: `brief-historical-dashboard-${sequence}`,
+                status: "completed",
+                phase: "completed",
+                createdAt: "2026-06-25T09:00:00.000Z",
+                updatedAt: "2026-06-25T09:01:00.000Z",
+                startedAt: "2026-06-25T09:00:00.000Z",
+                endedAt: "2026-06-25T09:01:00.000Z",
+                completionSummary: "Historical run completed.",
+                activeRuntimeMs: 1000,
+                nextAction: null,
+                decisionsUsed: 1,
+                tasksStarted: 1,
+                fixAttemptsByTaskId: {},
+                recoveryAttemptsByTaskId: {},
+                queue: [],
+                decisions: [],
+                timeline: [{ at: "2026-06-25T09:01:00.000Z", kind: "status", summary: "Completed." }],
+                codexThreads: {},
+                limits: {
+                    maxManagerDecisions: 12,
+                    maxTasks: 8,
+                    maxFixAttemptsPerTask: 1,
+                    maxRuntimeMs: 60000
+                },
+                workers: []
+            };
+        })
+    ];
+    return { tasks, plans, projectBriefs: [], autopilotRuns };
+}
+function verificationRecords(taskId) {
+    return ["npm test", "npm run check", "npm run build"].map((command) => ({
+        command,
+        attempt: 1,
+        startedAt: "2026-06-26T10:00:10.000Z",
+        endedAt: "2026-06-26T10:00:20.000Z",
+        exitCode: 0,
+        status: "passed",
+        outputRef: "large-dashboard-state",
+        isCurrent: true,
+        evidence: {
+            source: "build-worker",
+            taskId,
+            executionRoot: "large-dashboard-state",
+            expectedCommands: ["npm test", "npm run check", "npm run build"],
+            outputRef: "large-dashboard-state",
+            recordedAt: "2026-06-26T10:00:20.000Z",
+            explanation: "Persisted by large dashboard fixture."
+        }
+    }));
 }

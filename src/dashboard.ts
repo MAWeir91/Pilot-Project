@@ -238,6 +238,15 @@ export function renderDashboardHtml(): string {
     const detailsBody = document.getElementById("details-body");
     const fields = ["Task", "Project", "Task ID", "Updated", "Status", "Task State", "Codex Access", "Approval", "Verification", "Risks", "Build", "Review", "Recent activity", ""];
     const planFields = ["Plan", "Project", "Plan ID", "Updated", "Status", "Summary", "Recent activity", ""];
+    const dashboardState = {
+      tasks: [],
+      plans: [],
+      runs: [],
+      configuration: {},
+      stateHealth: {},
+      readiness: {},
+      errors: {}
+    };
 
     function text(value) {
       return value === null || value === undefined || value === "" ? "-" : String(value);
@@ -248,13 +257,28 @@ export function renderDashboardHtml(): string {
       return '<div class="tags">' + tags.map((tag) => '<span class="tag">' + escapeHtml(tag) + '</span>').join("") + '</div>';
     }
 
-    function render(tasks, plans, runs, configuration, stateHealth, readiness) {
+    function markUpdated() {
       refreshed.textContent = "Last updated: " + new Date().toLocaleTimeString();
-      warning.style.display = "none";
-      const readinessPanel = renderReadiness(readiness || {});
-      const configPanel = renderConfiguration(configuration || {});
-      const statePanel = renderStateHealth(stateHealth || {});
-      const autopilotPanel = renderAutopilotRuns(runs || []);
+    }
+
+    function renderCurrent() {
+      render(
+        dashboardState.tasks,
+        dashboardState.plans,
+        dashboardState.runs,
+        dashboardState.configuration,
+        dashboardState.stateHealth,
+        dashboardState.readiness,
+        dashboardState.errors
+      );
+    }
+
+    function render(tasks, plans, runs, configuration, stateHealth, readiness, errors) {
+      errors = errors || {};
+      const readinessPanel = errors.readiness ? unavailablePanel("Readiness / Health", errors.readiness) : renderReadiness(readiness || {});
+      const configPanel = errors.configuration ? unavailablePanel("Manager Mode", errors.configuration) : renderConfiguration(configuration || {});
+      const statePanel = errors.stateHealth ? unavailablePanel("State Store", errors.stateHealth) : renderStateHealth(stateHealth || {});
+      const autopilotPanel = errors.autopilot ? unavailablePanel("Autopilot Runs", errors.autopilot) : renderAutopilotRuns(runs || []);
 
       const taskRows = tasks.map((task) => {
         const preview = Array.isArray(task.latestLogPreview) ? task.latestLogPreview.slice(0, 3).join("\\n") : "No recent activity.";
@@ -316,8 +340,13 @@ export function renderDashboardHtml(): string {
         configPanel +
         statePanel +
         autopilotPanel +
-        (plans.length ? planTable : '<section><h3>Plans</h3><div class="empty">No plans yet.</div></section>') +
-        (tasks.length ? taskTable : '<section><h3>Tasks</h3><div class="empty">No tasks yet.</div></section>');
+        (errors.plans ? unavailablePanel("Plans", errors.plans) : plans.length ? planTable : '<section><h3>Plans</h3><div class="empty">No plans yet.</div></section>') +
+        (errors.tasks ? unavailablePanel("Tasks", errors.tasks) : tasks.length ? taskTable : '<section><h3>Tasks</h3><div class="empty">No tasks yet.</div></section>');
+    }
+
+    function unavailablePanel(title, detail) {
+      return '<section><h3>' + escapeHtml(title) + '</h3><div class="empty">This section is temporarily unavailable.' +
+        '<div class="muted">' + escapeHtml(detail || "Try again shortly.") + '</div></div></section>';
     }
 
     function renderConfiguration(configuration) {
@@ -326,6 +355,7 @@ export function renderDashboardHtml(): string {
         ? configuration.projects.map((project) => {
           const maintenance = project.maintenance || {};
           const preflight = maintenance.preflight || {};
+          const preflightStatus = preflight.ok === true ? "passed" : preflight.ok === false ? "blocked" : "not checked";
           return '<tr>' +
             '<td>' + escapeHtml(project.projectName || project.projectId) + '<div class="muted mono">' + escapeHtml(project.projectId) + '</div></td>' +
             '<td>' + escapeHtml(maintenance.enabled ? "enabled" : "disabled") + '</td>' +
@@ -334,7 +364,7 @@ export function renderDashboardHtml(): string {
             '<td class="mono">' + escapeHtml(text(maintenance.executionRoot)) + '</td>' +
             '<td>' + escapeHtml(text(maintenance.expectedBranch)) + '<div class="muted">base: ' + escapeHtml(text(maintenance.baseBranch)) + '</div></td>' +
             '<td class="preview">' + escapeHtml(text(maintenance.manualHandoff && maintenance.manualHandoff.message)) + '</td>' +
-            '<td>' + escapeHtml(preflight.ok ? "passed" : "blocked") + '<div class="muted preview">' + escapeHtml(text(maintenance.cannotStartReason)) + '</div></td>' +
+            '<td>' + escapeHtml(preflightStatus) + '<div class="muted preview">' + escapeHtml(text(maintenance.cannotStartReason || preflight.reason)) + '</div></td>' +
           '</tr>';
         }).join("")
         : "";
@@ -466,32 +496,76 @@ export function renderDashboardHtml(): string {
       })[char]);
     }
 
-    async function refresh() {
+    async function fetchJson(path, label, timeoutMs) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
       try {
-        const [tasksResponse, plansResponse, autopilotResponse, configurationResponse, stateHealthResponse, readinessResponse] = await Promise.all([
-          fetch("/dashboard/tasks", { cache: "no-store" }),
-          fetch("/dashboard/plans", { cache: "no-store" }),
-          fetch("/dashboard/autopilot", { cache: "no-store" }),
-          fetch("/dashboard/configuration", { cache: "no-store" }),
-          fetch("/dashboard/state-health", { cache: "no-store" }),
-          fetch("/dashboard/readiness", { cache: "no-store" })
-        ]);
-        if (!tasksResponse.ok) throw new Error("Tasks HTTP " + tasksResponse.status);
-        if (!plansResponse.ok) throw new Error("Plans HTTP " + plansResponse.status);
-        if (!autopilotResponse.ok) throw new Error("Autopilot HTTP " + autopilotResponse.status);
-        if (!configurationResponse.ok) throw new Error("Configuration HTTP " + configurationResponse.status);
-        if (!stateHealthResponse.ok) throw new Error("State health HTTP " + stateHealthResponse.status);
-        if (!readinessResponse.ok) throw new Error("Readiness HTTP " + readinessResponse.status);
-        const taskData = await tasksResponse.json();
-        const planData = await plansResponse.json();
-        const autopilotData = await autopilotResponse.json();
-        const configurationData = await configurationResponse.json();
-        const stateHealthData = await stateHealthResponse.json();
-        const readinessData = await readinessResponse.json();
-        render(taskData.tasks || [], planData.plans || [], autopilotData.runs || [], configurationData, stateHealthData, readinessData);
+        const response = await fetch(path, { cache: "no-store", signal: controller.signal });
+        if (!response.ok) throw new Error(label + " HTTP " + response.status);
+        return await response.json();
       } catch (error) {
-        warning.style.display = "inline";
+        if (error.name === "AbortError") {
+          throw new Error(label + " timed out.");
+        }
+        throw error;
+      } finally {
+        clearTimeout(timeout);
       }
+    }
+
+    function recordFailure(key, message) {
+      dashboardState.errors[key] = message || "This section did not respond in time.";
+      warning.textContent = "Some dashboard sections are temporarily unavailable.";
+      warning.style.display = "inline";
+      renderCurrent();
+    }
+
+    async function refresh() {
+      const core = fetchJson("/dashboard/core", "Core dashboard data", 3500)
+        .then((data) => {
+          dashboardState.tasks = data.tasks || [];
+          dashboardState.plans = data.plans || [];
+          dashboardState.runs = data.runs || [];
+          delete dashboardState.errors.tasks;
+          delete dashboardState.errors.plans;
+          delete dashboardState.errors.autopilot;
+          markUpdated();
+          renderCurrent();
+        })
+        .catch((error) => {
+          recordFailure("tasks", error.message);
+          recordFailure("plans", error.message);
+          recordFailure("autopilot", error.message);
+        });
+
+      const configuration = fetchJson("/dashboard/configuration", "Configuration", 2500)
+        .then((data) => {
+          dashboardState.configuration = data;
+          delete dashboardState.errors.configuration;
+          markUpdated();
+          renderCurrent();
+        })
+        .catch((error) => recordFailure("configuration", error.message));
+
+      const stateHealth = fetchJson("/dashboard/state-health", "State health", 2500)
+        .then((data) => {
+          dashboardState.stateHealth = data;
+          delete dashboardState.errors.stateHealth;
+          markUpdated();
+          renderCurrent();
+        })
+        .catch((error) => recordFailure("stateHealth", error.message));
+
+      const readiness = fetchJson("/dashboard/readiness", "Readiness", 2500)
+        .then((data) => {
+          dashboardState.readiness = data;
+          delete dashboardState.errors.readiness;
+          markUpdated();
+          renderCurrent();
+        })
+        .catch((error) => recordFailure("readiness", error.message));
+
+      await Promise.allSettled([core, configuration, stateHealth, readiness]);
     }
 
     async function showDetails(taskId) {

@@ -9,19 +9,41 @@ import { ListToolsRequestSchema, type ListToolsResult } from "@modelcontextproto
 import * as z from "zod/v4";
 import { JobService } from "./jobs.js";
 import type { LocalLauncherState } from "./local-launcher-core.js";
-import { AutopilotService, runtimeSnapshot } from "./manager.js";
+import { AutopilotService, managerConfigurationStatus, runtimeSnapshot } from "./manager.js";
 import { buildReadinessSummary } from "./readiness.js";
 import { getProjectStatus } from "./status.js";
 import { renderDashboardHtml } from "./dashboard.js";
 import { WindowsAutopilotNotifier } from "./notifications.js";
-import { DATA_DIR, dataPath } from "./paths.js";
+import {
+  ALLOWLISTED_PROJECT_ROOT,
+  DATA_DIR,
+  PROJECTS_FILE,
+  buildReportFile,
+  dataPath,
+  reviewReportFile,
+  taskBuildReportFile,
+  taskReviewReportFile
+} from "./paths.js";
 import { StateStore } from "./state.js";
+import { CODEX_ACCESS_MODE, CODEX_ACCESS_WARNING, CODEX_APPROVAL_POLICY } from "./codex.js";
+import { readLogTail, readTextIfExists } from "./logs.js";
+import { evaluateApprovalPolicy, projectVerificationCommands } from "./approval-policy.js";
+import { DEFAULT_PROJECT_ID } from "./projects.js";
+import { deriveTaskStatus } from "./task-status.js";
+import { buildAutopilotAuditSummary } from "./audit.js";
+import { taskArtifactRoot } from "./execution.js";
 import type {
   AutopilotRunRecord,
   AutopilotTaskQueueItem,
   AutopilotTimelineEntry,
   AutopilotWorkerLease,
+  PlanDetails,
+  PlanRecord,
   PlanSummary,
+  ProjectRecord,
+  TaskDetails,
+  TaskRecord,
+  TaskState,
   TaskSummary
 } from "./types.js";
 
@@ -40,6 +62,10 @@ const store = new StateStore();
 const jobs = new JobService(store);
 const autopilot = new AutopilotService({ store, jobs, notifier: new WindowsAutopilotNotifier() });
 const NOAUTH_SECURITY_SCHEMES = [{ type: "noauth" as const }];
+const DASHBOARD_ENDPOINT_TIMEOUT_MS = 1_500;
+const MAX_DASHBOARD_TASKS = 200;
+const MAX_DASHBOARD_PLANS = 100;
+const MAX_DASHBOARD_RUNS = 100;
 
 type ToolsListHandler = (request: unknown, extra: unknown) => ListToolsResult | Promise<ListToolsResult>;
 type ToolWithSecuritySchemes = ListToolsResult["tools"][number] & {
@@ -47,6 +73,9 @@ type ToolWithSecuritySchemes = ListToolsResult["tools"][number] & {
 };
 type RequestHandlerHost = {
   _requestHandlers: Map<string, ToolsListHandler>;
+};
+type CreateAppOptions = {
+  reconcileOnStart?: boolean;
 };
 
 function jsonToolResult(value: unknown) {
@@ -737,10 +766,17 @@ export function createServer(): McpServer {
   return server;
 }
 
-export function createApp(jobService = jobs, autopilotService = autopilot, stateStore = store): express.Express {
+export function createApp(
+  jobService = jobs,
+  autopilotService = autopilot,
+  stateStore = store,
+  options: CreateAppOptions = {}
+): express.Express {
   const app = express();
-  void jobService.reconcileUnfinishedTasks();
-  void autopilotService.reconcileAndResume();
+  if (options.reconcileOnStart ?? true) {
+    void jobService.reconcileUnfinishedTasks();
+    void autopilotService.reconcileAndResume();
+  }
   app.use(express.json({ limit: "1mb" }));
   app.use((req, res, next) => {
     if (!isLoopbackAddress(req.socket.remoteAddress)) {
@@ -759,24 +795,14 @@ export function createApp(jobService = jobs, autopilotService = autopilot, state
   });
 
   app.get("/dashboard/tasks", async (_req: Request, res: Response) => {
-    try {
-      const result = await jobService.listTasks();
-      res.json({
-        tasks: result.tasks.map(toDashboardTask)
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown error.";
-      res.status(500).json({ error: `Failed to refresh dashboard tasks: ${message}` });
-    }
+    await sendDashboardJson(res, "tasks", async () => ({
+      tasks: (await dashboardSnapshot(stateStore)).tasks
+    }));
   });
 
   app.get("/dashboard/tasks/:taskId", async (req: Request, res: Response) => {
     try {
-      const details = await jobService.getTaskDetails(req.params.taskId);
-      res.json({
-        ...details,
-        ...classifyTaskSummary(details)
-      });
+      res.json(await dashboardTaskDetails(stateStore, req.params.taskId));
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error.";
       res.status(message.includes("Unknown taskId") ? 404 : 400).json({ error: message });
@@ -784,20 +810,14 @@ export function createApp(jobService = jobs, autopilotService = autopilot, state
   });
 
   app.get("/dashboard/plans", async (_req: Request, res: Response) => {
-    try {
-      const result = await jobService.listPlans();
-      res.json({
-        plans: result.plans.map(toDashboardPlan)
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown error.";
-      res.status(500).json({ error: `Failed to refresh dashboard plans: ${message}` });
-    }
+    await sendDashboardJson(res, "plans", async () => ({
+      plans: (await dashboardSnapshot(stateStore)).plans
+    }));
   });
 
   app.get("/dashboard/plans/:planId", async (req: Request, res: Response) => {
     try {
-      res.json(await jobService.getPlanDetails(req.params.planId));
+      res.json(await dashboardPlanDetails(stateStore, req.params.planId));
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error.";
       res.status(message.includes("Unknown planId") ? 404 : 400).json({ error: message });
@@ -805,7 +825,7 @@ export function createApp(jobService = jobs, autopilotService = autopilot, state
   });
 
   app.get("/dashboard/configuration", async (_req: Request, res: Response) => {
-    res.json(await autopilotService.configurationStatus());
+    await sendDashboardJson(res, "configuration", async () => await dashboardConfigurationSnapshot());
   });
 
   app.get("/dashboard/state-health", async (_req: Request, res: Response) => {
@@ -818,16 +838,16 @@ export function createApp(jobService = jobs, autopilotService = autopilot, state
 
   app.get("/dashboard/readiness", async (_req: Request, res: Response) => {
     try {
-      const [configuration, stateHealth, runs] = await Promise.all([
-        autopilotService.configurationStatus(),
-        stateStore.health(),
-        autopilotService.listAutopilotRuns()
+      const [configuration, stateHealth, snapshot] = await Promise.all([
+        withTimeout(dashboardConfigurationSnapshot(), DASHBOARD_ENDPOINT_TIMEOUT_MS, "configuration"),
+        withTimeout(stateStore.health(), DASHBOARD_ENDPOINT_TIMEOUT_MS, "state health"),
+        withTimeout(dashboardSnapshot(stateStore), DASHBOARD_ENDPOINT_TIMEOUT_MS, "dashboard snapshot")
       ]);
       res.json(
         buildReadinessSummary({
           configuration,
           stateHealth,
-          runs: runs.runs,
+          runs: snapshot.rawRuns,
           launcherState: readLocalLauncherState()
         })
       );
@@ -837,21 +857,25 @@ export function createApp(jobService = jobs, autopilotService = autopilot, state
   });
 
   app.get("/dashboard/autopilot", async (_req: Request, res: Response) => {
-    try {
-      const result = await autopilotService.listAutopilotRuns();
-      res.json({
-        runs: await Promise.all(result.runs.map((run) => toDashboardAutopilotRun(run, jobService)))
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown error.";
-      res.status(500).json({ error: `Failed to refresh autopilot runs: ${message}` });
-    }
+    await sendDashboardJson(res, "autopilot runs", async () => ({
+      runs: (await dashboardSnapshot(stateStore)).runs
+    }));
+  });
+
+  app.get("/dashboard/core", async (_req: Request, res: Response) => {
+    await sendDashboardJson(res, "core dashboard data", async () => {
+      const snapshot = await dashboardSnapshot(stateStore);
+      return {
+        tasks: snapshot.tasks,
+        plans: snapshot.plans,
+        runs: snapshot.runs
+      };
+    });
   });
 
   app.get("/dashboard/autopilot/:runId", async (req: Request, res: Response) => {
     try {
-      const run = await autopilotService.getAutopilotStatus(req.params.runId);
-      res.json(await toDashboardAutopilotRunDetails(run, jobService));
+      res.json(await dashboardAutopilotDetails(stateStore, req.params.runId));
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error.";
       res.status(message.includes("Unknown autopilot") ? 404 : 400).json({ error: message });
@@ -975,6 +999,315 @@ function isLoopbackAddress(address: string | undefined): boolean {
   return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
 }
 
+async function sendDashboardJson(res: Response, label: string, producer: () => Promise<unknown>): Promise<void> {
+  try {
+    res.json(await withTimeout(producer(), DASHBOARD_ENDPOINT_TIMEOUT_MS, label));
+  } catch (error) {
+    const timedOut = error instanceof DashboardTimeoutError;
+    res.status(timedOut ? 503 : 500).json({
+      error: timedOut
+        ? `Dashboard ${label} snapshot timed out after ${DASHBOARD_ENDPOINT_TIMEOUT_MS} ms.`
+        : `Failed to refresh dashboard ${label}: ${errorMessage(error)}`
+    });
+  }
+}
+
+class DashboardTimeoutError extends Error {
+  constructor(label: string, timeoutMs: number) {
+    super(`${label} timed out after ${timeoutMs} ms.`);
+  }
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new DashboardTimeoutError(label, timeoutMs)), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
+}
+
+type DashboardSnapshot = {
+  tasks: ReturnType<typeof toDashboardTask>[];
+  plans: ReturnType<typeof toDashboardPlan>[];
+  runs: Awaited<ReturnType<typeof toDashboardAutopilotRun>>[];
+  rawRuns: Array<AutopilotRunRecord & { audit: ReturnType<typeof buildAutopilotAuditSummary> }>;
+};
+
+async function dashboardSnapshot(stateStore: StateStore): Promise<DashboardSnapshot> {
+  const [state, projects] = await Promise.all([stateStore.read(), readDashboardProjects()]);
+  const taskRecords = latestRecords(state.tasks, MAX_DASHBOARD_TASKS);
+  const planRecords = latestRecords(state.plans ?? [], MAX_DASHBOARD_PLANS);
+  const rawRuns = latestRecords(state.autopilotRuns ?? [], MAX_DASHBOARD_RUNS).map((run) => ({
+    ...run,
+    audit: buildAutopilotAuditSummary(run)
+  }));
+
+  const taskSummaries = await Promise.all(taskRecords.map((task) => dashboardTaskSummary(task, projects)));
+  const taskSummaryById = new Map(taskSummaries.map((task) => [task.taskId, task]));
+  const planSummaries = await Promise.all(planRecords.map((plan) => dashboardPlanSummary(plan, projects)));
+
+  return {
+    tasks: taskSummaries.map(toDashboardTask),
+    plans: planSummaries.map(toDashboardPlan),
+    rawRuns,
+    runs: await Promise.all(rawRuns.map((run) => toDashboardAutopilotRun(run, taskSummaryById.get(run.currentTaskId ?? ""))))
+  };
+}
+
+async function dashboardConfigurationSnapshot(): Promise<Record<string, unknown>> {
+  const projects = await readDashboardProjects();
+  return {
+    ...managerConfigurationStatus(),
+    projects: [...projects.values()]
+      .sort((left, right) => left.name.localeCompare(right.name))
+      .map((project) => ({
+        projectId: project.id,
+        projectName: project.name,
+        maintenance: dashboardMaintenanceMetadata(project)
+      }))
+  };
+}
+
+function dashboardMaintenanceMetadata(project: ProjectRecord): Record<string, unknown> {
+  if (project.maintenance?.enabled) {
+    return {
+      enabled: true,
+      mode: "maintenance/self-improvement",
+      operatorMessage:
+        "Project Pilot maintenance/self-improvement mode is active. Dashboard reads do not run Git preflight; worker launch actions still enforce maintenance protections.",
+      liveRoot: project.maintenance.liveRoot,
+      executionRoot: project.executionRoot ?? project.path,
+      baseBranch: project.maintenance.baseBranch,
+      expectedBranch: project.maintenance.expectedBranch,
+      manualHandoff: {
+        required: true,
+        message: "Review the isolated worktree manually before any commit, push, merge, deploy, or live-checkout update."
+      },
+      preflight: {
+        ok: null,
+        readOnly: true,
+        skipped: true,
+        reason: "Dashboard configuration reads do not run Git preflight."
+      },
+      canStart: null,
+      cannotStartReason: null
+    };
+  }
+
+  return {
+    enabled: false,
+    mode: "normal",
+    operatorMessage:
+      "Maintenance/self-improvement mode is not enabled for this project. Dashboard reads do not run Git preflight.",
+    liveRoot: project.path,
+    executionRoot: project.executionRoot ?? project.path,
+    baseBranch: project.defaultBranchName,
+    expectedBranch: null,
+    manualHandoff: {
+      required: false,
+      message: "No maintenance handoff is active."
+    },
+    preflight: {
+      ok: null,
+      readOnly: true,
+      skipped: true,
+      reason: "Dashboard configuration reads do not run Git preflight."
+    },
+    canStart: null,
+    cannotStartReason: null
+  };
+}
+
+async function dashboardTaskDetails(stateStore: StateStore, taskId: string): Promise<TaskDetails & ReturnType<typeof classifyTaskSummary>> {
+  const [state, projects] = await Promise.all([stateStore.read(), readDashboardProjects()]);
+  const task = state.tasks.find((candidate) => candidate.id === taskId);
+  if (!task) {
+    throw new Error(`Unknown taskId: ${taskId}`);
+  }
+  const project = projectForDashboardTask(task, projects);
+  const summary = await dashboardTaskSummary(task, projects);
+  const buildReportPath = taskBuildReportFile(taskArtifactRoot(project), task.id);
+  const reviewReportPath = taskReviewReportFile(taskArtifactRoot(project), task.id);
+  const legacyBuildReportPath = buildReportFile(taskArtifactRoot(project));
+  const legacyReviewReportPath = reviewReportFile(taskArtifactRoot(project));
+  const runId = findRunForTask(state, task.id)?.id ?? null;
+  const details: TaskDetails = {
+    ...summary,
+    requirements: task.requirements,
+    acceptanceCriteria: task.acceptanceCriteria,
+    statusHistory: buildStatusHistorySnapshot(task),
+    errors: collectTaskErrors(task),
+    buildLog: (await readTextIfExists(task.build.logPath).catch(() => undefined)) ?? "",
+    reviewLog: task.review?.logPath ? (await readTextIfExists(task.review.logPath).catch(() => undefined)) ?? "" : "",
+    buildReport:
+      (await readTextIfExists(buildReportPath).catch(() => undefined)) ??
+      (await readTextIfExists(legacyBuildReportPath).catch(() => undefined)) ??
+      null,
+    reviewReport:
+      (await readTextIfExists(reviewReportPath).catch(() => undefined)) ??
+      (await readTextIfExists(legacyReviewReportPath).catch(() => undefined)) ??
+      null,
+    evidencePaths: {
+      buildReport: buildReportPath,
+      reviewReport: reviewReportPath,
+      canonicalBuildReport: buildReportPath,
+      canonicalReviewReport: reviewReportPath,
+      legacyBuildReport: legacyBuildReportPath,
+      legacyReviewReport: legacyReviewReportPath
+    },
+    verificationIdentity: {
+      taskId: task.id,
+      runId,
+      executionRoot: taskArtifactRoot(project),
+      branch: project.maintenance?.expectedBranch || project.defaultBranchName || "unknown"
+    },
+    verification: task.verification ?? [],
+    verificationEvents: task.verificationEvents ?? [],
+    approvalActions: task.approvalActions ?? []
+  };
+  return {
+    ...details,
+    ...classifyTaskSummary(details)
+  };
+}
+
+async function dashboardPlanDetails(stateStore: StateStore, planId: string): Promise<PlanDetails> {
+  const [state, projects] = await Promise.all([stateStore.read(), readDashboardProjects()]);
+  const plan = (state.plans ?? []).find((candidate) => candidate.id === planId);
+  if (!plan) {
+    throw new Error(`Unknown planId: ${planId}`);
+  }
+  const summary = await dashboardPlanSummary(plan, projects);
+  const log = (await readTextIfExists(plan.logPath).catch(() => undefined)) ?? "";
+  return {
+    ...summary,
+    requirements: plan.requirements,
+    constraints: plan.constraints,
+    pid: plan.pid,
+    startedAt: plan.startedAt,
+    endedAt: plan.endedAt,
+    exitCode: plan.exitCode,
+    statusHistory: buildPlanStatusHistorySnapshot(plan),
+    errors: [plan.error].filter((error): error is string => Boolean(error)),
+    logTail: log.split(/\r?\n/).filter(Boolean).slice(-40).join("\n"),
+    report: (await readTextIfExists(plan.reportPath).catch(() => undefined)) ?? null,
+    log
+  };
+}
+
+async function dashboardAutopilotDetails(
+  stateStore: StateStore,
+  runId: string
+): Promise<Awaited<ReturnType<typeof toDashboardAutopilotRunDetails>>> {
+  const snapshot = await dashboardSnapshot(stateStore);
+  const run = snapshot.rawRuns.find((candidate) => candidate.id === runId);
+  if (!run) {
+    throw new Error(`Unknown autopilot runId: ${runId}`);
+  }
+  const activeTask = snapshot.tasks.find((task) => task.taskId === run.currentTaskId);
+  return await toDashboardAutopilotRunDetails(run, activeTask);
+}
+
+async function dashboardTaskSummary(task: TaskRecord, projects: Map<string, ProjectRecord>): Promise<TaskSummary> {
+  const project = projectForDashboardTask(task, projects);
+  const latestLogPath = task.review?.logPath ?? task.build.logPath;
+  const latestLogTail = await readLogTail(latestLogPath, 12).catch(() => "");
+  const configuredCommands = projectVerificationCommands(project);
+  return {
+    title: task.title,
+    projectId: project.id,
+    projectName: project.name,
+    taskId: task.id,
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+    completedAt: task.completedAt,
+    status: deriveTaskStatus(task),
+    codexAccessMode: CODEX_ACCESS_MODE,
+    codexApprovalPolicy: CODEX_APPROVAL_POLICY,
+    codexAccessWarning: CODEX_ACCESS_WARNING,
+    approval: evaluateApprovalPolicy({
+      task,
+      configuredCommands,
+      verification: task.verification
+    }),
+    verificationStatus: verificationDisplayStatusSnapshot(task, configuredCommands),
+    verificationSummary: summarizeVerificationSnapshot(task, configuredCommands),
+    buildSummary: summarizeBuildSnapshot(task),
+    reviewResult: task.review?.result ?? null,
+    latestLogLines: latestLogTail ? latestLogTail.split(/\r?\n/) : []
+  };
+}
+
+async function dashboardPlanSummary(plan: PlanRecord, projects: Map<string, ProjectRecord>): Promise<PlanSummary> {
+  const project = projects.get(plan.projectId) ?? fallbackProject(plan.projectId);
+  const [latestLogTail, report] = await Promise.all([
+    readLogTail(plan.logPath, 12).catch(() => ""),
+    readTextIfExists(plan.reportPath).catch(() => undefined)
+  ]);
+  return {
+    planId: plan.id,
+    projectId: project.id,
+    projectName: project.name,
+    title: plan.title,
+    createdAt: plan.createdAt,
+    updatedAt: plan.updatedAt,
+    status: plan.status,
+    summary: summarizePlanReportSnapshot(report),
+    reportPath: plan.reportPath,
+    error: plan.error,
+    latestLogLines: latestLogTail ? latestLogTail.split(/\r?\n/) : []
+  };
+}
+
+async function readDashboardProjects(): Promise<Map<string, ProjectRecord>> {
+  try {
+    const raw = await fs.promises.readFile(PROJECTS_FILE, "utf8");
+    const parsed = JSON.parse(raw) as { projects?: ProjectRecord[] };
+    const projects = Array.isArray(parsed.projects) ? parsed.projects : [];
+    return new Map(projects.map((project) => [project.id, project]));
+  } catch {
+    return new Map([[DEFAULT_PROJECT_ID, fallbackProject(DEFAULT_PROJECT_ID)]]);
+  }
+}
+
+function projectForDashboardTask(task: TaskRecord, projects: Map<string, ProjectRecord>): ProjectRecord {
+  const projectId = task.projectId ?? DEFAULT_PROJECT_ID;
+  return projects.get(projectId) ?? fallbackProject(projectId);
+}
+
+function fallbackProject(projectId: string): ProjectRecord {
+  return {
+    id: projectId,
+    name: projectId === DEFAULT_PROJECT_ID ? "Trade Journal Lite" : projectId,
+    path: ALLOWLISTED_PROJECT_ROOT,
+    buildCommand: "npm run build",
+    testCommand: "npm test",
+    checkCommand: "npm run check",
+    defaultBranchName: "main",
+    allowedGitBehavior: "feature branches, isolated worktrees, descriptive commits, non-protected branch pushes, and draft pull requests",
+    createdAt: "",
+    updatedAt: ""
+  };
+}
+
+function latestRecords<T extends { createdAt: string }>(records: T[], limit: number): T[] {
+  return [...records].sort((left, right) => right.createdAt.localeCompare(left.createdAt)).slice(0, limit);
+}
+
+function findRunForTask(state: TaskState, taskId: string): AutopilotRunRecord | undefined {
+  return (state.autopilotRuns ?? []).find(
+    (run) => run.currentTaskId === taskId || run.queue.some((item) => item.taskId === taskId || item.fixAttemptForTaskId === taskId)
+  );
+}
+
 function toDashboardTask(task: TaskSummary): Omit<TaskSummary, "latestLogLines"> & {
   latestLogPreview: string[];
   stateKind: string;
@@ -1024,7 +1357,7 @@ function toDashboardPlan(plan: PlanSummary): Omit<PlanSummary, "latestLogLines">
 
 async function toDashboardAutopilotRun(
   run: AutopilotRunRecord & { audit?: { runStateExplanation?: string; userActionRequired?: boolean } },
-  jobService: JobService
+  activeTask?: ActiveDashboardTask
 ): Promise<{
   id: string;
   projectId: string;
@@ -1065,9 +1398,6 @@ async function toDashboardAutopilotRun(
   auditSummary?: string;
   userActionRequired?: boolean;
 }> {
-  const activeTask = run.currentTaskId
-    ? await jobService.getTaskDetails(run.currentTaskId).catch(() => null)
-    : null;
   const workers = summarizeWorkers(run.workers ?? []);
   const queue = summarizeQueue(run.queue);
   return {
@@ -1100,7 +1430,11 @@ async function toDashboardAutopilotRun(
     codexThreadStatus: run.codexThreads.architectThreadId ? "architect thread active" : "no architect thread",
     runtime: runtimeSnapshot(run),
     limitPauseKind: limitPauseKind(run),
-    activeTaskLogPreview: activeTask ? summarizeLogPreview(activeTask.latestLogLines) : [],
+    activeTaskLogPreview: activeTask
+      ? activeTask.latestLogLines
+        ? summarizeLogPreview(activeTask.latestLogLines)
+        : activeTask.latestLogPreview ?? []
+      : [],
     activeTaskStatus: activeTask?.status ?? null,
     activeTaskBuildSummary: activeTask?.buildSummary ? (safeExcerpt(activeTask.buildSummary, 500) ?? null) : null,
     lastActivityAt: latestActivityAt(run),
@@ -1117,9 +1451,9 @@ async function toDashboardAutopilotRunDetails(
     maintenance?: Record<string, unknown>;
     audit?: { runStateExplanation?: string; userActionRequired?: boolean; explanations?: unknown[] };
   },
-  jobService: JobService
+  activeTask?: ActiveDashboardTask
 ) {
-  const summary = await toDashboardAutopilotRun(run, jobService);
+  const summary = await toDashboardAutopilotRun(run, activeTask);
   return {
     ...summary,
     decisions: run.decisions.slice(-10).map((decision) => ({
@@ -1144,6 +1478,11 @@ type DashboardQueueItem = Pick<
   stateExplanation: string;
   stateTags: string[];
 };
+
+type ActiveDashboardTask = Pick<TaskSummary, "status" | "buildSummary"> &
+  Partial<Pick<TaskSummary, "latestLogLines">> & {
+    latestLogPreview?: string[];
+  };
 
 type DashboardWorker = Pick<
   AutopilotWorkerLease,
@@ -1424,6 +1763,199 @@ function safeExcerpt(value: string | undefined | null, maxLength = 1_000): strin
     .replace(/\b(api[_-]?key|token|password|secret|credential)\b\s*[:=]\s*\S+/gi, "$1=[redacted]")
     .replace(/\b(sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,})\b/g, "[redacted]");
   return redacted.length > maxLength ? `${redacted.slice(0, maxLength - 3)}...` : redacted;
+}
+
+function buildStatusHistorySnapshot(task: TaskRecord): TaskDetails["statusHistory"] {
+  const entries: TaskDetails["statusHistory"] = [
+    {
+      status: "queued",
+      at: task.createdAt,
+      source: "Task created"
+    }
+  ];
+
+  if (task.build.startedAt) {
+    entries.push({ status: "building", at: task.build.startedAt, source: "Build started" });
+  }
+
+  if (task.build.endedAt) {
+    entries.push({
+      status:
+        task.build.status === "passed"
+          ? "build-passed"
+          : task.build.status === "failed"
+            ? "failed"
+            : task.build.status === "blocked"
+              ? "blocked"
+              : "stopped",
+      at: task.build.endedAt,
+      source: "Build finished"
+    });
+  }
+
+  if (task.review?.startedAt) {
+    entries.push({ status: "reviewing", at: task.review.startedAt, source: "Review started" });
+  }
+
+  if (task.review?.endedAt) {
+    entries.push({
+      status:
+        task.review.result === "pass"
+          ? "ready-for-approval"
+          : task.review.result === "needs-fixes"
+            ? "needs-fixes"
+            : task.review.status === "stopped"
+              ? "stopped"
+              : "blocked",
+      at: task.review.endedAt,
+      source: "Review finished"
+    });
+  }
+
+  if (deriveTaskStatus(task) === "completed") {
+    entries.push({ status: "completed", at: task.completedAt ?? task.updatedAt, source: "Task approved" });
+  }
+
+  return entries.sort((left, right) => left.at.localeCompare(right.at));
+}
+
+function buildPlanStatusHistorySnapshot(plan: PlanRecord): PlanDetails["statusHistory"] {
+  const entries: PlanDetails["statusHistory"] = [
+    {
+      status: "queued",
+      at: plan.createdAt,
+      source: "Plan created"
+    }
+  ];
+
+  if (plan.startedAt) {
+    entries.push({ status: "planning", at: plan.startedAt, source: "Planning started" });
+  }
+
+  if (plan.endedAt) {
+    entries.push({
+      status: plan.status === "plan-ready" ? "plan-ready" : "plan-blocked",
+      at: plan.endedAt,
+      source: "Planning finished"
+    });
+  }
+
+  return entries.sort((left, right) => left.at.localeCompare(right.at));
+}
+
+function collectTaskErrors(task: TaskRecord): string[] {
+  return [task.build.error, task.review?.error].filter((error): error is string => Boolean(error));
+}
+
+function summarizeBuildSnapshot(task: TaskRecord): string {
+  if (task.build.error) {
+    return task.build.error;
+  }
+
+  if (task.build.status === "queued") {
+    return "Build is queued.";
+  }
+
+  if (task.build.status === "running") {
+    return `Build is running${task.build.startedAt ? ` since ${task.build.startedAt}` : ""}.`;
+  }
+
+  if (task.build.status === "passed") {
+    return `Build passed${task.build.endedAt ? ` at ${task.build.endedAt}` : ""}.`;
+  }
+
+  if (task.build.status === "failed") {
+    const exit = task.build.exitCode === undefined ? "" : ` with exit code ${task.build.exitCode}`;
+    return `Build failed${exit}.`;
+  }
+
+  if (task.build.status === "blocked") {
+    return "Build blocked by Project Pilot infrastructure.";
+  }
+
+  return "Build stopped.";
+}
+
+function verificationDisplayStatusSnapshot(task: TaskRecord, commands: string[]): TaskSummary["verificationStatus"] {
+  const current = currentVerificationByCommandSnapshot(task.verification ?? []);
+  const records = commands.map((command) => current.get(normalizeCommandSnapshot(command)));
+  if (commands.length === 0 || records.some((record) => !record || record.status === "unknown")) {
+    return "unknown";
+  }
+  if (records.some((record) => record?.status === "failed")) {
+    return "failed";
+  }
+  if (records.some((record) => record?.evidence?.source === "reconciled-from-evidence")) {
+    return "reconciled-from-evidence";
+  }
+  return "passed";
+}
+
+function summarizeVerificationSnapshot(task: TaskRecord, commands: string[]): string {
+  if (commands.length === 0) {
+    return "No configured verification commands.";
+  }
+  const current = currentVerificationByCommandSnapshot(task.verification ?? []);
+  return commands
+    .map((command) => {
+      const record = current.get(normalizeCommandSnapshot(command));
+      if (!record) {
+        return `${command}: unknown (missing structured result)`;
+      }
+      const source = record.evidence?.source ? `, ${record.evidence.source}` : "";
+      const explanation = record.status === "unknown" && record.evidence?.explanation ? ` - ${record.evidence.explanation}` : "";
+      return `${command}: ${record.status}${source}${explanation}`;
+    })
+    .join("\n");
+}
+
+function currentVerificationByCommandSnapshot(records: TaskRecord["verification"] = []) {
+  const current = new Map<string, NonNullable<TaskRecord["verification"]>[number]>();
+  for (const record of records) {
+    if (record.isCurrent) {
+      current.set(normalizeCommandSnapshot(record.command), record);
+    }
+  }
+  return current;
+}
+
+function normalizeCommandSnapshot(command: string): string {
+  return command.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function summarizePlanReportSnapshot(report: string | undefined): string {
+  const normalized = normalizePlanReportTextSnapshot(report);
+  if (!normalized.trim()) {
+    return "No plan report available.";
+  }
+  const summary = extractPlanSectionSnapshot(normalized, "Summary Of The Request");
+  const firstParagraph = summary
+    .split(/\r?\n\r?\n/)
+    .map((block) => block.replace(/\s+/g, " ").trim())
+    .find(Boolean);
+
+  if (!firstParagraph) {
+    return "Plan report is available.";
+  }
+  return firstParagraph.length > 240 ? `${firstParagraph.slice(0, 237)}...` : firstParagraph;
+}
+
+function normalizePlanReportTextSnapshot(report: string | undefined): string {
+  if (!report) {
+    return "";
+  }
+  const actualHeadingCount = (report.match(/\r?\n##\s+/g) ?? []).length;
+  const escapedHeadingCount = (report.match(/\\n##\s+/g) ?? []).length;
+  if (escapedHeadingCount > actualHeadingCount) {
+    return report.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n").replace(/\\r/g, "\r");
+  }
+  return report;
+}
+
+function extractPlanSectionSnapshot(report: string, heading: string): string {
+  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = report.match(new RegExp(`##\\s+${escaped}\\s*\\r?\\n([\\s\\S]*?)(?=\\r?\\n##\\s+|$)`, "i"));
+  return match?.[1]?.trim() ?? "";
 }
 
 function readLocalLauncherState(): LocalLauncherState | undefined {
