@@ -7,6 +7,7 @@ import path from "node:path";
 import { spawn, execFile } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { DATA_DIR, PROJECT_PILOT_ROOT, STATE_FILE } from "./paths.js";
+import { buildReadinessSummary, formatReadinessSummary } from "./readiness.js";
 import type { TaskState } from "./types.js";
 import {
   findTunnelProfileProcesses,
@@ -155,6 +156,7 @@ async function printStatus(config: LocalLauncherConfig): Promise<void> {
   const portOpen = await isPortOpen(config.host, config.port);
   const dashboardHealthy = await dashboardHealth(config).catch(() => false);
   const launcherState = await readLauncherState(config);
+  const stateRead = await readTaskState();
 
   console.log(`[status] Dashboard: ${config.dashboardUrl}`);
   console.log(`[status] Project Pilot port 3000: ${portOpen ? "open" : "closed"}`);
@@ -169,8 +171,30 @@ async function printStatus(config: LocalLauncherConfig): Promise<void> {
       launcherState ? `pilot PID ${launcherState.pilotPid ?? "unknown"}, tunnel PID ${launcherState.tunnelPid ?? "unknown"}` : "none"
     }`
   );
-  const activeRun = await activeRunExists();
+  const activeRun = stateRead.state ? hasActiveAutopilotRun(stateRead.state) : false;
   console.log(`[status] Active Autopilot run: ${activeRun ? "yes" : "no"}`);
+  const readiness = buildReadinessSummary({
+    launcherState,
+    portOpen,
+    dashboardHealthy,
+    tunnelPids: tunnelProcesses.map((item) => item.pid),
+    stateHealth: {
+      filePath: STATE_FILE,
+      exists: stateRead.exists,
+      valid: stateRead.valid,
+      snapshotCount: 0,
+      orphanTempFiles: [],
+      lastError: stateRead.error
+    },
+    runs: stateRead.state?.autopilotRuns ?? [],
+    configuration: {
+      managerModeConfigured: Boolean(process.env.OPENAI_API_KEY?.trim())
+    }
+  });
+  console.log("[status] Readiness summary:");
+  for (const line of formatReadinessSummary(readiness)) {
+    console.log(`[status]   ${line}`);
+  }
 }
 
 async function openDashboard(config: LocalLauncherConfig): Promise<void> {
@@ -376,11 +400,20 @@ async function warnIfActiveRun(): Promise<void> {
 }
 
 async function activeRunExists(): Promise<boolean> {
+  const read = await readTaskState();
+  return read.state ? hasActiveAutopilotRun(read.state) : false;
+}
+
+async function readTaskState(): Promise<{ exists: boolean; valid: boolean; state?: TaskState; error?: string }> {
   try {
-    const state = JSON.parse(await fs.readFile(STATE_FILE, "utf8")) as TaskState;
-    return hasActiveAutopilotRun(state);
-  } catch {
-    return false;
+    const raw = await fs.readFile(STATE_FILE, "utf8");
+    return { exists: true, valid: true, state: JSON.parse(raw) as TaskState };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      return { exists: false, valid: true };
+    }
+    return { exists: true, valid: false, error: errorMessage(error) };
   }
 }
 

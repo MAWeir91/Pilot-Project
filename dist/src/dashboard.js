@@ -102,9 +102,9 @@ export function renderDashboardHtml() {
       font-weight: 650;
       white-space: nowrap;
     }
-    .status.ready-for-approval, .status.build-passed, .status.completed, .status.passed, .status.reconciled-from-evidence { color: var(--good); }
-    .status.needs-fixes, .status.unknown { color: var(--warn); }
-    .status.failed, .status.stopped { color: var(--bad); }
+    .status.ready-for-approval, .status.build-passed, .status.completed, .status.passed, .status.reconciled-from-evidence, .status.recovered, .status.ready { color: var(--good); }
+    .status.needs-fixes, .status.unknown, .status.skipped, .status.superseded, .status.warning { color: var(--warn); }
+    .status.failed, .status.stopped, .status.blocked, .status.dead { color: var(--bad); }
     .preview {
       max-width: 420px;
       white-space: pre-wrap;
@@ -185,6 +185,21 @@ export function renderDashboardHtml() {
       padding-left: 18px;
       line-height: 1.6;
     }
+    .tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      margin-top: 6px;
+    }
+    .tag {
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 2px 5px;
+      background: #ffffff;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 650;
+    }
     @media (max-width: 980px) {
       header { align-items: start; flex-direction: column; }
       .meta { justify-content: start; }
@@ -221,16 +236,22 @@ export function renderDashboardHtml() {
     const detailsTitle = document.getElementById("details-title");
     const detailsSubtitle = document.getElementById("details-subtitle");
     const detailsBody = document.getElementById("details-body");
-    const fields = ["Task", "Project", "Task ID", "Updated", "Status", "Codex Access", "Approval", "Verification", "Risks", "Build", "Review", "Recent activity", ""];
+    const fields = ["Task", "Project", "Task ID", "Updated", "Status", "Task State", "Codex Access", "Approval", "Verification", "Risks", "Build", "Review", "Recent activity", ""];
     const planFields = ["Plan", "Project", "Plan ID", "Updated", "Status", "Summary", "Recent activity", ""];
 
     function text(value) {
       return value === null || value === undefined || value === "" ? "-" : String(value);
     }
 
-    function render(tasks, plans, runs, configuration, stateHealth) {
+    function renderTags(tags) {
+      if (!Array.isArray(tags) || !tags.length) return "";
+      return '<div class="tags">' + tags.map((tag) => '<span class="tag">' + escapeHtml(tag) + '</span>').join("") + '</div>';
+    }
+
+    function render(tasks, plans, runs, configuration, stateHealth, readiness) {
       refreshed.textContent = "Last updated: " + new Date().toLocaleTimeString();
       warning.style.display = "none";
+      const readinessPanel = renderReadiness(readiness || {});
       const configPanel = renderConfiguration(configuration || {});
       const statePanel = renderStateHealth(stateHealth || {});
       const autopilotPanel = renderAutopilotRuns(runs || []);
@@ -257,6 +278,7 @@ export function renderDashboardHtml() {
           '<td class="mono">' + escapeHtml(task.taskId) + '</td>' +
           '<td class="mono muted">' + escapeHtml(task.updatedAt) + '</td>' +
           '<td><span class="status ' + escapeHtml(task.status) + '">' + escapeHtml(task.status) + '</span></td>' +
+          '<td><span class="status ' + escapeHtml(task.stateKind) + '">' + escapeHtml(text(task.stateLabel)) + '</span>' + renderTags(task.stateTags) + '<div class="muted preview">' + escapeHtml(text(task.stateExplanation)) + '</div></td>' +
           '<td class="preview">' + escapeHtml(codexAccess) + '</td>' +
           '<td>' + escapeHtml(text(approval.mode)) + '<div class="muted">' + escapeHtml(approvalReasons) + '</div></td>' +
           '<td><span class="status ' + escapeHtml(task.verificationStatus) + '">' + escapeHtml(text(task.verificationStatus)) + '</span><div class="muted preview">' + escapeHtml(text(task.verificationSummary)) + '</div></td>' +
@@ -290,7 +312,8 @@ export function renderDashboardHtml() {
         planFields.map((field) => '<th>' + escapeHtml(field) + '</th>').join("") +
         '</tr></thead><tbody>' + planRows + '</tbody></table></section>';
 
-      content.innerHTML = configPanel +
+      content.innerHTML = readinessPanel +
+        configPanel +
         statePanel +
         autopilotPanel +
         (plans.length ? planTable : '<section><h3>Plans</h3><div class="empty">No plans yet.</div></section>') +
@@ -306,9 +329,11 @@ export function renderDashboardHtml() {
           return '<tr>' +
             '<td>' + escapeHtml(project.projectName || project.projectId) + '<div class="muted mono">' + escapeHtml(project.projectId) + '</div></td>' +
             '<td>' + escapeHtml(maintenance.enabled ? "enabled" : "disabled") + '</td>' +
+            '<td class="preview">' + escapeHtml(text(maintenance.mode)) + '<div class="muted">' + escapeHtml(text(maintenance.operatorMessage)) + '</div></td>' +
             '<td class="mono">' + escapeHtml(text(maintenance.liveRoot)) + '</td>' +
             '<td class="mono">' + escapeHtml(text(maintenance.executionRoot)) + '</td>' +
             '<td>' + escapeHtml(text(maintenance.expectedBranch)) + '<div class="muted">base: ' + escapeHtml(text(maintenance.baseBranch)) + '</div></td>' +
+            '<td class="preview">' + escapeHtml(text(maintenance.manualHandoff && maintenance.manualHandoff.message)) + '</td>' +
             '<td>' + escapeHtml(preflight.ok ? "passed" : "blocked") + '<div class="muted preview">' + escapeHtml(text(maintenance.cannotStartReason)) + '</div></td>' +
           '</tr>';
         }).join("")
@@ -320,10 +345,28 @@ export function renderDashboardHtml() {
       '</tbody></table>' +
       (projectRows
         ? '<h3>Maintenance Execution</h3><table><thead><tr>' +
-          ["Project", "Mode", "Live Root", "Execution Root", "Expected Branch", "Preflight"].map((field) => '<th>' + escapeHtml(field) + '</th>').join("") +
+          ["Project", "Enabled", "Mode", "Live Root", "Execution Root", "Expected Branch", "Manual Handoff", "Preflight"].map((field) => '<th>' + escapeHtml(field) + '</th>').join("") +
           '</tr></thead><tbody>' + projectRows + '</tbody></table>'
         : "") +
       '</section>';
+    }
+
+    function renderReadiness(readiness) {
+      const components = Array.isArray(readiness.components) ? readiness.components : [];
+      const rows = components.map((component) => '<tr>' +
+        '<td>' + escapeHtml(text(component.name)) + '</td>' +
+        '<td><span class="status ' + escapeHtml(text(component.status)) + '">' + escapeHtml(text(component.status)) + '</span></td>' +
+        '<td class="preview">' + escapeHtml(text(component.summary)) + '</td>' +
+        '<td class="preview">' + escapeHtml(text(component.detail)) + '</td>' +
+      '</tr>').join("");
+      const problems = Array.isArray(readiness.problems) && readiness.problems.length ? readiness.problems.join("\\n") : "none";
+      return '<section><h3>Readiness / Health</h3><table><tbody>' +
+        '<tr><th>Overall</th><td><span class="status ' + escapeHtml(text(readiness.status)) + '">' + escapeHtml(text(readiness.status)) + '</span></td><th>User Action Required</th><td>' + escapeHtml(text(readiness.userActionRequired)) + '</td></tr>' +
+        '<tr><th>Generated</th><td class="mono">' + escapeHtml(text(readiness.generatedAt)) + '</td><th>Problems</th><td class="preview">' + escapeHtml(problems) + '</td></tr>' +
+      '</tbody></table>' +
+      '<table><thead><tr>' + ["Component", "Status", "Summary", "Detail"].map((field) => '<th>' + escapeHtml(field) + '</th>').join("") + '</tr></thead><tbody>' +
+      (rows || '<tr><td colspan="4">No readiness components reported.</td></tr>') +
+      '</tbody></table></section>';
     }
 
     function renderStateHealth(stateHealth) {
@@ -343,7 +386,7 @@ export function renderDashboardHtml() {
         return '<section><h3>Autopilot Runs</h3><div class="empty">No autopilot runs yet.</div></section>';
       }
       const rows = runs.map((run) => {
-        const queue = Array.isArray(run.queue) ? run.queue.map((item) => item.title + " [" + item.status + "]").join("\\n") : "-";
+        const queue = Array.isArray(run.queue) ? run.queue.map((item) => item.title + " [" + text(item.stateLabel || item.status) + "]").join("\\n") : "-";
         const runtime = run.runtime || {};
         const runtimeText = "Active: " + formatDuration(runtime.activeRuntimeMs) +
           "\\nWall-clock: " + formatDuration(runtime.wallClockElapsedMs) +
@@ -359,6 +402,7 @@ export function renderDashboardHtml() {
               "Worker: " + text(activeWorker.phase) + " / " + text(activeWorker.attemptType),
               "PID: " + text(activeWorker.pid || "pending"),
               "Started: " + text(activeWorker.startedAt),
+              "Last activity: " + text(activeWorker.lastActivityAt || activeWorker.endedAt || activeWorker.startedAt),
               "Command: " + text(activeWorker.command),
               "Report: " + text(activeWorker.reportPath)
             ].join("\\n")
@@ -371,7 +415,14 @@ export function renderDashboardHtml() {
               "Outcome: " + text(run.scheduler.lastDispatchOutcome || run.scheduler.skippedDispatchReason)
             ].join("\\n")
           : "No scheduler state.";
-        const actions = '<button type="button" data-pause-run-id="' + escapeHtml(run.id) + '">Pause</button> ' +
+        const activity = [
+          "Run updated: " + text(run.updatedAt),
+          "Last activity: " + text(run.lastActivityAt),
+          "Queue: " + text(run.queueStateSummary),
+          "Workers: " + text(run.workerStateSummary)
+        ].join("\\n");
+        const actions = '<button type="button" data-run-id="' + escapeHtml(run.id) + '">View details</button> ' +
+          '<button type="button" data-pause-run-id="' + escapeHtml(run.id) + '">Pause</button> ' +
           '<button type="button" data-resume-run-id="' + escapeHtml(run.id) + '">Resume</button> ' +
           '<button type="button" data-stop-run-id="' + escapeHtml(run.id) + '">Stop</button>';
         return '<tr>' +
@@ -384,13 +435,14 @@ export function renderDashboardHtml() {
           '<td class="preview">' + escapeHtml(runtimeText) + (limit ? '<div class="muted">' + escapeHtml(limit) + '</div>' : '') + '</td>' +
           '<td class="preview">' + escapeHtml(schedulerText) + '</td>' +
           '<td class="preview">' + escapeHtml(workerText) + '</td>' +
-          '<td>' + escapeHtml(text(run.nextAction)) + '<div class="muted">' + escapeHtml(text(run.codexThreadStatus)) + '</div></td>' +
+          '<td class="preview">' + escapeHtml(activity) + '</td>' +
+          '<td>' + escapeHtml(text(run.nextAction)) + '<div class="muted preview">' + escapeHtml(text(run.nextStepExplanation)) + '</div><div class="muted">' + escapeHtml(text(run.codexThreadStatus)) + '</div></td>' +
           '<td class="preview">' + escapeHtml(text(run.pauseReason || run.stopReason || run.completionSummary)) + (activeTask ? "\\n\\n" + escapeHtml(activeTask) : '') + '</td>' +
           '<td>' + actions + '</td>' +
         '</tr>';
       }).join("");
       return '<section><h3>Autopilot Runs</h3><table><thead><tr>' +
-        ["Run", "Project", "Brief / Plan", "Progress", "Current Task", "Queue", "Runtime Budget", "Scheduler", "Worker", "Next Action", "Reason / Summary", ""].map((field) => '<th>' + escapeHtml(field) + '</th>').join("") +
+        ["Run", "Project", "Brief / Plan", "Progress", "Current Task", "Queue", "Runtime Budget", "Scheduler", "Worker", "Activity", "Next Action", "Reason / Summary", ""].map((field) => '<th>' + escapeHtml(field) + '</th>').join("") +
         '</tr></thead><tbody>' + rows + '</tbody></table></section>';
     }
 
@@ -416,24 +468,27 @@ export function renderDashboardHtml() {
 
     async function refresh() {
       try {
-        const [tasksResponse, plansResponse, autopilotResponse, configurationResponse, stateHealthResponse] = await Promise.all([
+        const [tasksResponse, plansResponse, autopilotResponse, configurationResponse, stateHealthResponse, readinessResponse] = await Promise.all([
           fetch("/dashboard/tasks", { cache: "no-store" }),
           fetch("/dashboard/plans", { cache: "no-store" }),
           fetch("/dashboard/autopilot", { cache: "no-store" }),
           fetch("/dashboard/configuration", { cache: "no-store" }),
-          fetch("/dashboard/state-health", { cache: "no-store" })
+          fetch("/dashboard/state-health", { cache: "no-store" }),
+          fetch("/dashboard/readiness", { cache: "no-store" })
         ]);
         if (!tasksResponse.ok) throw new Error("Tasks HTTP " + tasksResponse.status);
         if (!plansResponse.ok) throw new Error("Plans HTTP " + plansResponse.status);
         if (!autopilotResponse.ok) throw new Error("Autopilot HTTP " + autopilotResponse.status);
         if (!configurationResponse.ok) throw new Error("Configuration HTTP " + configurationResponse.status);
         if (!stateHealthResponse.ok) throw new Error("State health HTTP " + stateHealthResponse.status);
+        if (!readinessResponse.ok) throw new Error("Readiness HTTP " + readinessResponse.status);
         const taskData = await tasksResponse.json();
         const planData = await plansResponse.json();
         const autopilotData = await autopilotResponse.json();
         const configurationData = await configurationResponse.json();
         const stateHealthData = await stateHealthResponse.json();
-        render(taskData.tasks || [], planData.plans || [], autopilotData.runs || [], configurationData, stateHealthData);
+        const readinessData = await readinessResponse.json();
+        render(taskData.tasks || [], planData.plans || [], autopilotData.runs || [], configurationData, stateHealthData, readinessData);
       } catch (error) {
         warning.style.display = "inline";
       }
@@ -470,6 +525,24 @@ export function renderDashboardHtml() {
         detailsTitle.textContent = plan.title;
         detailsSubtitle.textContent = plan.planId;
         detailsBody.innerHTML = renderPlanDetails(plan);
+      } catch (error) {
+        detailsBody.innerHTML = '<section><h3>Error</h3><pre>' + escapeHtml(error.message) + '</pre></section>';
+      }
+    }
+
+    async function showRunDetails(runId) {
+      detailsTitle.textContent = "Loading run details";
+      detailsSubtitle.textContent = runId;
+      detailsBody.innerHTML = "";
+      openDetails();
+
+      try {
+        const response = await fetch("/dashboard/autopilot/" + encodeURIComponent(runId), { cache: "no-store" });
+        if (!response.ok) throw new Error("HTTP " + response.status);
+        const run = await response.json();
+        detailsTitle.textContent = "Autopilot run";
+        detailsSubtitle.textContent = run.id;
+        detailsBody.innerHTML = renderRunDetails(run);
       } catch (error) {
         detailsBody.innerHTML = '<section><h3>Error</h3><pre>' + escapeHtml(error.message) + '</pre></section>';
       }
@@ -595,6 +668,8 @@ export function renderDashboardHtml() {
       return '<div class="details-grid">' +
           fact("Project", task.projectName) +
           fact("Status", task.status) +
+          fact("Task State", task.stateLabel) +
+          fact("State Tags", Array.isArray(task.stateTags) && task.stateTags.length ? task.stateTags.join(", ") : "-") +
           fact("Codex Access Mode", task.codexAccessMode) +
           fact("Codex Approval Policy", task.codexApprovalPolicy) +
           fact("Approval Mode", task.approval && task.approval.mode) +
@@ -604,6 +679,7 @@ export function renderDashboardHtml() {
           fact("Updated", task.updatedAt) +
         '</div>' +
         section("Codex Access Warning", task.codexAccessWarning) +
+        section("Task State Explanation", task.stateExplanation) +
         section("Approval Policy", task.approval && Array.isArray(task.approval.reasons) ? task.approval.reasons.join("\\n") : "-") +
         section("Verification", verificationText(task)) +
         section("Risk Evidence", task.approval ? approvalEvidenceText(task.approval) : "-") +
@@ -618,6 +694,136 @@ export function renderDashboardHtml() {
         section("REVIEW_REPORT.md", task.reviewReport || "No REVIEW_REPORT.md found.") +
         section("Full Build Log", task.buildLog || "No build log output.") +
         section("Full Review Log", task.reviewLog || "No review log output.");
+    }
+
+    function renderRunDetails(run) {
+      return '<div class="details-grid">' +
+          fact("Project", run.projectId) +
+          fact("Status", run.status) +
+          fact("Phase", run.phase) +
+          fact("Current Task", run.currentTaskId) +
+          fact("Last Completed Task", run.lastCompletedTaskId) +
+          fact("Last Activity", run.lastActivityAt) +
+          fact("Decisions Used", run.decisionsUsed) +
+          fact("Tasks Started", run.tasksStarted) +
+        '</div>' +
+        section("Runtime", runtimeDetailsText(run)) +
+        section("Remaining Limits", limitsText(run)) +
+        section("Queue State", queueDetailsText(run.queue)) +
+        section("Worker Status", workerDetailsText(run.workers)) +
+        section("Scheduler Tick", schedulerDetailsText(run.scheduler)) +
+        section("Current Phase / Task / Next Action", [
+          "Phase: " + text(run.phase),
+          "Current task: " + text(run.currentTaskId),
+          "Next action: " + text(run.nextAction),
+          "Explanation: " + text(run.nextStepExplanation)
+        ].join("\\n")) +
+        section("Pause / Stop / Completion Explanation", text(run.pauseReason || run.stopReason || run.completionSummary || "No pause, stop, or completion explanation recorded.")) +
+        section("Audit Explanation", auditExplanationText(run.audit)) +
+        section("Recovery History", recoveryDetailsText(run.recoveryHistory)) +
+        '<section><h3>Persistent Active-Run Timeline</h3><ol class="history">' +
+          (Array.isArray(run.timeline) ? run.timeline.map((item) => '<li><span class="mono">' + escapeHtml(item.at) + '</span> ' + escapeHtml(item.kind) + ' - ' + escapeHtml(item.summary) + '</li>').join("") : "") +
+        '</ol></section>' +
+        section("Manager Decisions", decisionsText(run.decisions)) +
+        section("Active Task Context", [
+          "Task status: " + text(run.activeTaskStatus),
+          "Build: " + text(run.activeTaskBuildSummary),
+          "Recent activity:",
+          ...(Array.isArray(run.activeTaskLogPreview) ? run.activeTaskLogPreview : [])
+        ].join("\\n"));
+    }
+
+    function runtimeDetailsText(run) {
+      const runtime = run.runtime || {};
+      return [
+        "Active runtime: " + formatDuration(runtime.activeRuntimeMs),
+        "Wall-clock runtime: " + formatDuration(runtime.wallClockElapsedMs),
+        "Runtime limit: " + formatDuration(runtime.runtimeLimitMs),
+        "Remaining active runtime: " + formatDuration(runtime.remainingActiveRuntimeMs),
+        "Active runtime started: " + text(runtime.activeRuntimeStartedAt)
+      ].join("\\n");
+    }
+
+    function limitsText(run) {
+      const limits = run.limits || {};
+      const runtime = run.runtime || {};
+      return [
+        "Manager decisions: " + text(run.decisionsUsed) + " / " + text(limits.maxManagerDecisions),
+        "Tasks: " + text(run.tasksStarted) + " / " + text(limits.maxTasks),
+        "Fix attempts per task: " + text(limits.maxFixAttemptsPerTask),
+        "Runtime remaining: " + formatDuration(runtime.remainingActiveRuntimeMs),
+        "Limit pause kind: " + text(run.limitPauseKind)
+      ].join("\\n");
+    }
+
+    function queueDetailsText(queue) {
+      if (!Array.isArray(queue) || !queue.length) return "Queue is empty.";
+      return queue.map((item) => [
+        "- " + text(item.title) + " | " + text(item.stateLabel) + " | " + text(item.source),
+        "  State tags: " + (Array.isArray(item.stateTags) && item.stateTags.length ? item.stateTags.join(", ") : "-"),
+        "  Queue ID: " + text(item.id),
+        "  Task ID: " + text(item.taskId),
+        "  Original task: " + text(item.fixAttemptForTaskId),
+        "  Explanation: " + text(item.stateExplanation),
+        "  Updated: " + text(item.updatedAt)
+      ].join("\\n")).join("\\n");
+    }
+
+    function workerDetailsText(workers) {
+      if (!Array.isArray(workers) || !workers.length) return "No worker leases recorded.";
+      return workers.map((worker) => [
+        "- " + text(worker.phase) + " | " + text(worker.stateLabel) + " | " + text(worker.attemptType),
+        "  Task ID: " + text(worker.taskId),
+        "  PID: " + text(worker.pid || "pending"),
+        "  Started: " + text(worker.startedAt),
+        "  Ended: " + text(worker.endedAt),
+        "  Last activity: " + text(worker.lastActivityAt),
+        "  Report: " + text(worker.reportPath),
+        "  Log: " + text(worker.logPath),
+        "  Outcome: " + text(worker.outcome)
+      ].join("\\n")).join("\\n");
+    }
+
+    function schedulerDetailsText(scheduler) {
+      scheduler = scheduler || {};
+      return [
+        "Last tick: " + text(scheduler.lastTickAt),
+        "Next tick: " + text(scheduler.nextScheduledTickAt),
+        "In progress: " + text(scheduler.inProgress),
+        "Dispatch: " + text(scheduler.dispatchStatus),
+        "Outcome: " + text(scheduler.lastDispatchOutcome),
+        "Skipped reason: " + text(scheduler.skippedDispatchReason)
+      ].join("\\n");
+    }
+
+    function recoveryDetailsText(history) {
+      if (!Array.isArray(history) || !history.length) return "No recovery attempts recorded.";
+      return history.map((item) => "- " + Object.entries(item).map(([key, value]) => key + "=" + text(value)).join(" | ")).join("\\n");
+    }
+
+    function decisionsText(decisions) {
+      if (!Array.isArray(decisions) || !decisions.length) return "No manager decisions recorded.";
+      return decisions.map((item) => [
+        "- " + text(item.at) + " | " + text(item.action),
+        "  Summary: " + text(item.summary),
+        "  Reason: " + text(item.reason)
+      ].join("\\n")).join("\\n");
+    }
+
+    function auditExplanationText(audit) {
+      if (!audit) return "No audit explanation summary recorded.";
+      const entries = Array.isArray(audit.explanations) ? audit.explanations : [];
+      const lines = [
+        "User action required: " + text(audit.userActionRequired),
+        "Run state: " + text(audit.runStateExplanation),
+        "",
+        ...entries.map((item) => [
+          "- " + text(item.at) + " | " + text(item.category) + " | userActionRequired=" + text(item.userActionRequired),
+          "  Summary: " + text(item.summary),
+          "  Explanation: " + text(item.explanation)
+        ].join("\\n"))
+      ];
+      return lines.join("\\n");
     }
 
     function approvalEvidenceText(approval) {
@@ -714,6 +920,12 @@ export function renderDashboardHtml() {
       const planButton = event.target.closest("button[data-plan-id]");
       if (planButton) {
         showPlanDetails(planButton.getAttribute("data-plan-id"));
+        return;
+      }
+
+      const runButton = event.target.closest("button[data-run-id]");
+      if (runButton) {
+        showRunDetails(runButton.getAttribute("data-run-id"));
         return;
       }
 

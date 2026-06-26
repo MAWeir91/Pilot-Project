@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as z from "zod/v4";
 import { evaluateApprovalPolicy } from "./approval-policy.js";
+import { buildAutopilotAuditSummary } from "./audit.js";
 import { buildReportFile, reviewReportFile } from "./paths.js";
 import { maintenanceStatus, maintenanceStatusFromError, taskArtifactRoot } from "./execution.js";
 import { ProjectRegistry } from "./projects.js";
@@ -425,15 +426,25 @@ export class AutopilotService {
     return { runId: run.id, status: run.status, run };
   }
 
-  async getAutopilotStatus(runId: string): Promise<AutopilotRunRecord & { maintenance: Record<string, unknown> }> {
+  async getAutopilotStatus(
+    runId: string
+  ): Promise<AutopilotRunRecord & { maintenance: Record<string, unknown>; audit: ReturnType<typeof buildAutopilotAuditSummary> }> {
     const run = await this.requireRun(runId);
-    return { ...run, maintenance: await this.maintenanceStatusForRun(run) };
+    return { ...run, maintenance: await this.maintenanceStatusForRun(run), audit: buildAutopilotAuditSummary(run) };
   }
 
-  async listAutopilotRuns(): Promise<{ runs: Array<AutopilotRunRecord & { maintenance: Record<string, unknown> }> }> {
+  async listAutopilotRuns(): Promise<{
+    runs: Array<AutopilotRunRecord & { maintenance: Record<string, unknown>; audit: ReturnType<typeof buildAutopilotAuditSummary> }>;
+  }> {
     const runs = await this.store.listAutopilotRuns();
     return {
-      runs: await Promise.all(runs.map(async (run) => ({ ...run, maintenance: await this.maintenanceStatusForRun(run) })))
+      runs: await Promise.all(
+        runs.map(async (run) => ({
+          ...run,
+          maintenance: await this.maintenanceStatusForRun(run),
+          audit: buildAutopilotAuditSummary(run)
+        }))
+      )
     };
   }
 

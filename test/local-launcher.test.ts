@@ -10,6 +10,7 @@ import {
   type LocalLauncherState,
   type ProcessInfo
 } from "../src/local-launcher-core.js";
+import { buildReadinessSummary, formatReadinessSummary } from "../src/readiness.js";
 import type { AutopilotPhase, AutopilotRunRecord, AutopilotStatus, TaskState } from "../src/types.js";
 
 describe("local launcher core", () => {
@@ -121,6 +122,51 @@ describe("local launcher core", () => {
 
     expect(hasActiveAutopilotRun(inactive)).toBe(false);
     expect(hasActiveAutopilotRun(active)).toBe(true);
+  });
+
+  it("builds a non-secret readiness summary across launcher, tunnel, state, scheduler, active run, and config", () => {
+    const state: LocalLauncherState = {
+      version: 1,
+      createdAt: "2026-06-25T00:00:00.000Z",
+      launcherPid: 1,
+      pilotPid: 20,
+      tunnelPid: 21,
+      tunnelCommand: "tunnel-client",
+      tunnelArgs: ["run", "--profile", "project-pilot"],
+      tunnelProfile: "project-pilot",
+      dashboardUrl: "http://127.0.0.1:3000/dashboard"
+    };
+    const run = {
+      ...runWithStatus("running"),
+      scheduler: { dispatchStatus: "dispatched", lastTickAt: "2026-06-25T00:00:01.000Z" }
+    };
+    const summary = buildReadinessSummary({
+      launcherState: state,
+      portOpen: true,
+      dashboardHealthy: true,
+      tunnelPids: [21],
+      stateHealth: {
+        filePath: "C:\\project-pilot\\data\\tasks.json",
+        exists: true,
+        valid: true,
+        snapshotCount: 2,
+        orphanTempFiles: []
+      },
+      runs: [run],
+      configuration: { managerModeConfigured: false }
+    });
+
+    expect(summary.components.map((component) => component.name)).toEqual([
+      "launcher",
+      "tunnel",
+      "state-store",
+      "scheduler",
+      "active-run",
+      "configuration"
+    ]);
+    expect(summary.status).toBe("blocked");
+    expect(summary.problems.join("\n")).toMatch(/manager API key is not configured/);
+    expect(formatReadinessSummary(summary).join("\n")).not.toMatch(/token|secret|password/i);
   });
 });
 

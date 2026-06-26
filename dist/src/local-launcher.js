@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, execFile } from "node:child_process";
 import { DATA_DIR, PROJECT_PILOT_ROOT, STATE_FILE } from "./paths.js";
+import { buildReadinessSummary, formatReadinessSummary } from "./readiness.js";
 import { findTunnelProfileProcesses, hasActiveAutopilotRun, ownedStopTargets, parseLocalLauncherConfig, startPreflight } from "./local-launcher-core.js";
 const command = parseCommand(process.argv[2]);
 const config = parseLocalLauncherConfig(process.env, PROJECT_PILOT_ROOT);
@@ -127,13 +128,36 @@ async function printStatus(config) {
     const portOpen = await isPortOpen(config.host, config.port);
     const dashboardHealthy = await dashboardHealth(config).catch(() => false);
     const launcherState = await readLauncherState(config);
+    const stateRead = await readTaskState();
     console.log(`[status] Dashboard: ${config.dashboardUrl}`);
     console.log(`[status] Project Pilot port 3000: ${portOpen ? "open" : "closed"}`);
     console.log(`[status] Dashboard health: ${dashboardHealthy ? "healthy" : "unavailable"}`);
     console.log(`[status] Tunnel profile ${config.tunnelProfile}: ${tunnelProcesses.length > 0 ? `running as PID(s) ${tunnelProcesses.map((item) => item.pid).join(", ")}` : "not running"}`);
     console.log(`[status] Launcher ownership: ${launcherState ? `pilot PID ${launcherState.pilotPid ?? "unknown"}, tunnel PID ${launcherState.tunnelPid ?? "unknown"}` : "none"}`);
-    const activeRun = await activeRunExists();
+    const activeRun = stateRead.state ? hasActiveAutopilotRun(stateRead.state) : false;
     console.log(`[status] Active Autopilot run: ${activeRun ? "yes" : "no"}`);
+    const readiness = buildReadinessSummary({
+        launcherState,
+        portOpen,
+        dashboardHealthy,
+        tunnelPids: tunnelProcesses.map((item) => item.pid),
+        stateHealth: {
+            filePath: STATE_FILE,
+            exists: stateRead.exists,
+            valid: stateRead.valid,
+            snapshotCount: 0,
+            orphanTempFiles: [],
+            lastError: stateRead.error
+        },
+        runs: stateRead.state?.autopilotRuns ?? [],
+        configuration: {
+            managerModeConfigured: Boolean(process.env.OPENAI_API_KEY?.trim())
+        }
+    });
+    console.log("[status] Readiness summary:");
+    for (const line of formatReadinessSummary(readiness)) {
+        console.log(`[status]   ${line}`);
+    }
 }
 async function openDashboard(config) {
     await openUrl(config.dashboardUrl);
@@ -321,12 +345,20 @@ async function warnIfActiveRun() {
     }
 }
 async function activeRunExists() {
+    const read = await readTaskState();
+    return read.state ? hasActiveAutopilotRun(read.state) : false;
+}
+async function readTaskState() {
     try {
-        const state = JSON.parse(await fs.readFile(STATE_FILE, "utf8"));
-        return hasActiveAutopilotRun(state);
+        const raw = await fs.readFile(STATE_FILE, "utf8");
+        return { exists: true, valid: true, state: JSON.parse(raw) };
     }
-    catch {
-        return false;
+    catch (error) {
+        const code = error.code;
+        if (code === "ENOENT") {
+            return { exists: false, valid: true };
+        }
+        return { exists: true, valid: false, error: errorMessage(error) };
     }
 }
 async function readLauncherState(config) {

@@ -179,18 +179,46 @@ export function maintenanceStatus(project, runner = runGit) {
     const maintenance = project.maintenance?.enabled
         ? {
             enabled: true,
+            mode: "maintenance/self-improvement",
+            operatorMessage: "Project Pilot maintenance/self-improvement mode is active. Workers use the isolated execution worktree and end with manual operator handoff; Project Pilot will not push, merge, deploy, or mutate the live checkout.",
             liveRoot: redactSensitiveText(canonicalPath(project.maintenance.liveRoot)),
             executionRoot: redactSensitiveText(canonicalPath(project.executionRoot ?? project.path)),
             baseBranch: redactSensitiveText(project.maintenance.baseBranch),
             expectedBranch: redactSensitiveText(project.maintenance.expectedBranch),
+            branchHandling: {
+                baseBranch: redactSensitiveText(project.maintenance.baseBranch),
+                expectedBranch: redactSensitiveText(project.maintenance.expectedBranch)
+            },
+            worktreeHandling: {
+                isolatedWorktreeRequired: true,
+                liveRootMutationAllowed: false
+            },
+            manualHandoff: {
+                required: true,
+                message: "Review the isolated worktree manually before any commit, push, merge, deploy, or live-checkout update."
+            },
             allowDirtyWorkingTree: project.maintenance.allowDirtyWorkingTree === true
         }
         : {
             enabled: false,
+            mode: "normal",
+            operatorMessage: "Maintenance/self-improvement mode is not enabled for this project. The registered root is used unless executionRoot is configured separately.",
             liveRoot: redactSensitiveText(canonicalPath(project.path)),
             executionRoot: redactSensitiveText(canonicalPath(project.executionRoot ?? project.path)),
             baseBranch: redactSensitiveText(project.defaultBranchName),
             expectedBranch: null,
+            branchHandling: {
+                baseBranch: redactSensitiveText(project.defaultBranchName),
+                expectedBranch: null
+            },
+            worktreeHandling: {
+                isolatedWorktreeRequired: false,
+                liveRootMutationAllowed: canonicalPath(project.path) !== CANONICAL_PROJECT_PILOT_LIVE_ROOT
+            },
+            manualHandoff: {
+                required: false,
+                message: "No maintenance handoff is active."
+            },
             allowDirtyWorkingTree: false
         };
     return {

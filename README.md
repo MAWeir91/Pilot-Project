@@ -18,6 +18,7 @@ It also serves a local task dashboard at:
 - `list_projects`: returns registered local projects and the active project id.
 - `get_project`: returns one registered project by `projectId`.
 - `register_project`: adds or updates an approved local project with command and Git metadata.
+- `configure_maintenance_execution`: enables, disables, or updates self-maintenance execution for a registered project after validating the isolated worktree, live root, base branch, expected branch, and dirty-working-tree policy.
 - `set_active_project`: changes the default project used by task tools when no `projectId` is supplied.
 - `get_active_project`: returns the active registered project.
 - `create_project_brief`: persists a durable project brief that ChatGPT can synthesize from the current conversation when you say "Start Autopilot".
@@ -152,6 +153,79 @@ If `tunnel-client` is not on `PATH`, set `PROJECT_PILOT_TUNNEL_COMMAND` to the f
 - Tunnel missing or not configured: install the tunnel client, add it to `PATH`, or set `PROJECT_PILOT_TUNNEL_COMMAND` to the executable path in `.env`.
 - Transitioning from the old multiple-terminal setup: stop the old `npm run dev` terminal and the old tunnel terminal first. Then use `npm run local` so the launcher owns both child processes and one `Ctrl+C` can stop both.
 - Active Autopilot work: `npm run local:stop` warns if a run appears active. It stops only the local server/tunnel it owns and does not terminate active worker PIDs.
+
+## Operator Runbook
+
+These steps are for the local Project Pilot checkout and its isolated maintenance worktrees. They do not restart, deploy, push, merge, or modify any live Project Pilot service. Treat live-service updates as a separate manual operation after reviewing the local branch output.
+
+### Startup
+
+1. Open PowerShell in the local Project Pilot checkout.
+2. Run `npm run local`.
+3. Confirm the dashboard opens at `http://127.0.0.1:3000/dashboard` or run `npm run local:status`.
+4. Check the dashboard readiness panel. Continue only when no component is `blocked`. A `warning` needs operator judgment before starting long-running work.
+
+Use `npm run dev` only for server-only development without the tunnel. It still binds to `127.0.0.1` and does not control the tunnel process.
+
+### Shutdown
+
+1. Prefer `Ctrl+C` in the terminal that started `npm run local`.
+2. If the launcher terminal is gone, run `npm run local:status` first, then `npm run local:stop` only when the status shows launcher-owned PIDs.
+3. If Autopilot work is active or waiting, pause or stop it intentionally through the dashboard or MCP tools before stopping the local server.
+
+Shutdown affects only launcher-owned local Project Pilot and tunnel child processes. It does not stop arbitrary Node, Codex, PowerShell, tunnel, or live-service processes.
+
+### Maintenance Mode
+
+Maintenance mode is for Project Pilot self-improvement from an isolated Git worktree. Configure it with `configure_maintenance_execution` or the equivalent dashboard/client flow using:
+
+- `projectId`: the registered Project Pilot maintenance project.
+- `liveRoot`: the live checkout path that must not be mutated by workers.
+- `executionRoot`: the isolated worktree where `TASK.md`, reports, worker logs, and changes are written.
+- `baseBranch` and `expectedBranch`: the branch readiness boundary for the worktree.
+- `allowDirtyWorkingTree` plus `dirtyWorkingTreeReason`: only when a dirty worktree is intentional and documented.
+
+Before launching planning, build, review, or Autopilot workers, Project Pilot validates that the execution root exists, is a Git repository root, is a listed worktree, is not the live checkout, has the expected branch context, and satisfies the dirty-working-tree policy. Failed preflight blocks local work and records bounded diagnostics without exposing `.env`, tunnel keys, credentials, file contents, or live `data/`.
+
+### Local Status And Troubleshooting
+
+Use these local checks before starting work, before handoff, and after failures:
+
+```powershell
+npm run local:status
+npm run check
+```
+
+- `npm run local:status` reports launcher ownership, port 3000, dashboard health, tunnel profile PIDs, readiness components, and active-run state.
+- The dashboard readiness panel reports launcher, tunnel, state-store, scheduler, active-run, and configuration status.
+- `npm run check` runs the TypeScript build and test suite for the current checkout.
+
+Do not paste secrets into tasks, reports, logs, issue text, or documentation. If troubleshooting requires configuration details, describe the variable name and symptom, not the secret value.
+
+### Controlled Restart After Branch Readiness
+
+Use this sequence after a maintenance branch is ready for operator review:
+
+1. Verify local readiness: dashboard readiness is not `blocked`, maintenance status is `ready`, the task build passed, review passed or is `ready-for-approval`, and `BUILD_REPORT.md` reports `Final status: passed`.
+2. Inspect the isolated worktree diff, `BUILD_REPORT.md`, and `REVIEW_REPORT.md`. Confirm no secrets, live `data/`, tunnel keys, or unintended files are included.
+3. If Project Pilot approval/finalization is appropriate, use the dashboard or MCP approval tools. These tools record approval state only; they do not commit, push, merge, deploy, or restart the live service.
+4. Stop the local launcher with `Ctrl+C` or `npm run local:stop` when there is no active local work that must continue.
+5. Perform any commit, push, pull request, merge, live-checkout update, deployment, or live-service restart manually under the operator's normal Git and service runbook.
+6. Start the local service again with `npm run local` and recheck `npm run local:status`.
+
+The handoff point is step 5. Project Pilot's local maintenance workflow ends with reviewed files in the isolated worktree and explicit reports; live integration is a human-controlled action.
+
+### Failed Local Run Recovery
+
+1. Preserve the local evidence first: `TASK.md`, `BUILD_REPORT.md`, `REVIEW_REPORT.md`, `PLAN_REPORT.md`, dashboard status, and relevant log tails.
+2. Run `npm run local:status` to identify whether the failure is launcher, tunnel, state-store, scheduler, active-run, or configuration related.
+3. For duplicate port or tunnel failures, stop the terminal that owns the old process, or use `npm run local:stop` only for launcher-owned PIDs.
+4. For blocked maintenance preflight, fix the isolated worktree condition shown in readiness: wrong branch, missing worktree, dirty tree without reason, missing base branch, or execution root pointing at the live checkout.
+5. For failed builds or reviews, inspect the reports in the execution root, make the smallest local correction, then rerun the relevant project checks before retrying review or starting another task.
+6. For state-store warnings or blocked scheduler state, avoid hand-editing `data/` while the server is running. Stop the local launcher, preserve a backup of the affected JSON and snapshots, then recover only from known-good local evidence.
+7. Restart with `npm run local` and verify readiness before resuming Autopilot or creating new maintenance tasks.
+
+If recovery requires credentials, external service access, a live deployment, a protected-branch merge, or a live-service restart, stop the local Project Pilot workflow and hand off to the operator with the exact user action needed.
 
 For server-only development without the tunnel, the existing command remains:
 

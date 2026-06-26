@@ -44,12 +44,26 @@ describe("maintenance execution isolation", () => {
     expect(configured).toMatchObject({ preflight: { ok: true } });
     expect(status).toMatchObject({
       enabled: true,
+      mode: "maintenance/self-improvement",
       liveRoot,
       executionRoot,
       expectedBranch: "feature/self-improvement-dashboard-workflow-v1",
+      branchHandling: {
+        baseBranch: "main",
+        expectedBranch: "feature/self-improvement-dashboard-workflow-v1"
+      },
+      worktreeHandling: {
+        isolatedWorktreeRequired: true,
+        liveRootMutationAllowed: false
+      },
+      manualHandoff: {
+        required: true
+      },
       canStart: true,
       cannotStartReason: null
     });
+    expect(String(status.operatorMessage)).toMatch(/self-improvement mode/i);
+    expect(String((status.manualHandoff as { message?: unknown }).message)).toMatch(/manual/i);
   });
 
   it("accepts a valid isolated worktree only through the dedicated configuration operation", async () => {

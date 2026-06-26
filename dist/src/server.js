@@ -9,6 +9,7 @@ import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod/v4";
 import { JobService } from "./jobs.js";
 import { AutopilotService, runtimeSnapshot } from "./manager.js";
+import { buildReadinessSummary } from "./readiness.js";
 import { getProjectStatus } from "./status.js";
 import { renderDashboardHtml } from "./dashboard.js";
 import { WindowsAutopilotNotifier } from "./notifications.js";
@@ -579,7 +580,11 @@ export function createApp(jobService = jobs, autopilotService = autopilot, state
     });
     app.get("/dashboard/tasks/:taskId", async (req, res) => {
         try {
-            res.json(await jobService.getTaskDetails(req.params.taskId));
+            const details = await jobService.getTaskDetails(req.params.taskId);
+            res.json({
+                ...details,
+                ...classifyTaskSummary(details)
+            });
         }
         catch (error) {
             const message = error instanceof Error ? error.message : "Unknown error.";
@@ -618,6 +623,24 @@ export function createApp(jobService = jobs, autopilotService = autopilot, state
             res.status(500).json({ error: `Failed to inspect state health: ${errorMessage(error)}` });
         }
     });
+    app.get("/dashboard/readiness", async (_req, res) => {
+        try {
+            const [configuration, stateHealth, runs] = await Promise.all([
+                autopilotService.configurationStatus(),
+                stateStore.health(),
+                autopilotService.listAutopilotRuns()
+            ]);
+            res.json(buildReadinessSummary({
+                configuration,
+                stateHealth,
+                runs: runs.runs,
+                launcherState: readLocalLauncherState()
+            }));
+        }
+        catch (error) {
+            res.status(500).json({ error: `Failed to inspect readiness: ${errorMessage(error)}` });
+        }
+    });
     app.get("/dashboard/autopilot", async (_req, res) => {
         try {
             const result = await autopilotService.listAutopilotRuns();
@@ -628,6 +651,16 @@ export function createApp(jobService = jobs, autopilotService = autopilot, state
         catch (error) {
             const message = error instanceof Error ? error.message : "Unknown error.";
             res.status(500).json({ error: `Failed to refresh autopilot runs: ${message}` });
+        }
+    });
+    app.get("/dashboard/autopilot/:runId", async (req, res) => {
+        try {
+            const run = await autopilotService.getAutopilotStatus(req.params.runId);
+            res.json(await toDashboardAutopilotRunDetails(run, jobService));
+        }
+        catch (error) {
+            const message = error instanceof Error ? error.message : "Unknown error.";
+            res.status(message.includes("Unknown autopilot") ? 404 : 400).json({ error: message });
         }
     });
     app.post("/dashboard/autopilot/:runId/pause", async (req, res) => {
@@ -740,6 +773,7 @@ function isLoopbackAddress(address) {
     return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
 }
 function toDashboardTask(task) {
+    const state = classifyTaskSummary(task);
     return {
         title: task.title,
         projectId: task.projectId,
@@ -757,7 +791,8 @@ function toDashboardTask(task) {
         verificationSummary: task.verificationSummary,
         buildSummary: task.buildSummary,
         reviewResult: task.reviewResult,
-        latestLogPreview: summarizeLogPreview(task.latestLogLines)
+        latestLogPreview: summarizeLogPreview(task.latestLogLines),
+        ...state
     };
 }
 function toDashboardPlan(plan) {
@@ -779,8 +814,33 @@ async function toDashboardAutopilotRun(run, jobService) {
     const activeTask = run.currentTaskId
         ? await jobService.getTaskDetails(run.currentTaskId).catch(() => null)
         : null;
+    const workers = summarizeWorkers(run.workers ?? []);
+    const queue = summarizeQueue(run.queue);
     return {
-        ...run,
+        id: run.id,
+        projectId: run.projectId,
+        briefId: run.briefId,
+        planId: run.planId,
+        status: run.status,
+        phase: run.phase,
+        createdAt: run.createdAt,
+        updatedAt: run.updatedAt,
+        startedAt: run.startedAt,
+        endedAt: run.endedAt,
+        pausedAt: run.pausedAt,
+        pauseReason: safeExcerpt(run.pauseReason),
+        stopReason: safeExcerpt(run.stopReason),
+        completionSummary: safeExcerpt(run.completionSummary),
+        currentTaskId: run.currentTaskId,
+        lastCompletedTaskId: run.lastCompletedTaskId,
+        nextAction: run.nextAction ?? null,
+        decisionsUsed: run.decisionsUsed,
+        tasksStarted: run.tasksStarted,
+        queue,
+        workers,
+        scheduler: run.scheduler,
+        limits: run.limits,
+        recoveryAttemptsByTaskId: run.recoveryAttemptsByTaskId ?? {},
         queuedTasks: run.queue.filter((item) => item.status === "queued").length,
         currentTask: run.currentTaskId ?? null,
         codexThreadStatus: run.codexThreads.architectThreadId ? "architect thread active" : "no architect thread",
@@ -788,8 +848,276 @@ async function toDashboardAutopilotRun(run, jobService) {
         limitPauseKind: limitPauseKind(run),
         activeTaskLogPreview: activeTask ? summarizeLogPreview(activeTask.latestLogLines) : [],
         activeTaskStatus: activeTask?.status ?? null,
-        activeTaskBuildSummary: activeTask?.buildSummary ?? null
+        activeTaskBuildSummary: activeTask?.buildSummary ? (safeExcerpt(activeTask.buildSummary, 500) ?? null) : null,
+        lastActivityAt: latestActivityAt(run),
+        queueStateSummary: queueStateSummary(queue),
+        workerStateSummary: workerStateSummary(workers),
+        nextStepExplanation: nextStepExplanation(run),
+        auditSummary: run.audit?.runStateExplanation,
+        userActionRequired: run.audit?.userActionRequired
     };
+}
+async function toDashboardAutopilotRunDetails(run, jobService) {
+    const summary = await toDashboardAutopilotRun(run, jobService);
+    return {
+        ...summary,
+        decisions: run.decisions.slice(-10).map((decision) => ({
+            at: decision.at,
+            action: decision.action,
+            summary: safeExcerpt(decision.summary, 500),
+            reason: safeExcerpt(decision.reason, 500)
+        })),
+        timeline: summarizeTimeline(run.timeline),
+        recoveryHistory: recoveryHistory(run),
+        maintenance: run.maintenance,
+        audit: run.audit
+    };
+}
+function classifyTaskSummary(task) {
+    const text = [task.buildSummary, ...task.latestLogLines].join("\n");
+    if (task.status === "completed") {
+        return {
+            stateKind: "completed historical",
+            stateLabel: "Completed / historical",
+            stateExplanation: "Task passed build and review gates and was marked complete.",
+            stateTags: ["completed", "historical"],
+            historical: true
+        };
+    }
+    if (task.status === "blocked") {
+        return {
+            stateKind: "blocked",
+            stateLabel: "Blocked",
+            stateExplanation: "Task is paused by a blocker or infrastructure failure that needs attention.",
+            stateTags: ["blocked"],
+            historical: false
+        };
+    }
+    if (task.status === "stopped" && /duplicate|superseded|skipped|historical record/i.test(text)) {
+        return {
+            stateKind: "superseded skipped historical",
+            stateLabel: "Superseded / skipped / historical",
+            stateExplanation: "Task was skipped because another active, reviewed, or completed task covers the same work.",
+            stateTags: ["superseded", "skipped", "historical"],
+            historical: true
+        };
+    }
+    if (task.status === "stopped") {
+        return {
+            stateKind: "stopped historical",
+            stateLabel: "Stopped / historical",
+            stateExplanation: "Task is no longer active and remains visible for audit history.",
+            stateTags: ["stopped", "historical"],
+            historical: true
+        };
+    }
+    if (/recovered|recovery/i.test(text)) {
+        return {
+            stateKind: "recovered",
+            stateLabel: "Recovered",
+            stateExplanation: "Task has recovery evidence in its recorded activity.",
+            stateTags: ["recovered"],
+            historical: false
+        };
+    }
+    const active = task.status === "queued" || task.status === "building" || task.status === "reviewing";
+    return {
+        stateKind: active ? "active" : "historical",
+        stateLabel: active ? "Active" : "Historical",
+        stateExplanation: active ? "Task is queued or currently running." : "Task is retained for review and audit context.",
+        stateTags: active ? ["active"] : ["historical"],
+        historical: !active
+    };
+}
+function summarizeQueue(queue) {
+    return queue.map((item) => {
+        const state = classifyQueueItem(item);
+        return {
+            id: item.id,
+            title: safeExcerpt(item.title, 240) ?? "",
+            source: item.source,
+            taskId: item.taskId,
+            status: item.status,
+            fixAttemptForTaskId: item.fixAttemptForTaskId,
+            createdAt: item.createdAt,
+            updatedAt: item.updatedAt,
+            ...state
+        };
+    });
+}
+function classifyQueueItem(item) {
+    if (item.source === "recovery") {
+        return {
+            stateKind: item.status === "completed" ? "recovered historical" : "recovery",
+            stateLabel: item.status === "completed" ? "Recovered / historical" : "Recovery",
+            stateExplanation: item.fixAttemptForTaskId
+                ? `Recovery work for ${item.fixAttemptForTaskId}.`
+                : "Recovery work queued by Project Pilot.",
+            stateTags: item.status === "completed" ? ["recovered", "historical"] : ["recovery"]
+        };
+    }
+    if (item.status === "skipped") {
+        return {
+            stateKind: "superseded skipped historical",
+            stateLabel: "Superseded / skipped / historical",
+            stateExplanation: "Queue item was intentionally skipped and retained for audit.",
+            stateTags: ["superseded", "skipped", "historical"]
+        };
+    }
+    if (item.status === "completed") {
+        return {
+            stateKind: "completed historical",
+            stateLabel: "Completed / historical",
+            stateExplanation: "Queue item already completed.",
+            stateTags: ["completed", "historical"]
+        };
+    }
+    if (item.status === "blocked") {
+        return {
+            stateKind: "blocked",
+            stateLabel: "Blocked",
+            stateExplanation: "Queue item cannot dispatch until the blocker is resolved.",
+            stateTags: ["blocked"]
+        };
+    }
+    return {
+        stateKind: item.status,
+        stateLabel: item.status === "active" ? "Active" : item.status === "queued" ? "Queued" : "Failed",
+        stateExplanation: `Queue item is ${item.status}.`,
+        stateTags: [item.status]
+    };
+}
+function summarizeWorkers(workers) {
+    return workers.map((worker) => ({
+        id: worker.id,
+        taskId: worker.taskId,
+        phase: worker.phase,
+        pid: worker.pid,
+        command: worker.command,
+        startedAt: worker.startedAt,
+        endedAt: worker.endedAt,
+        attemptType: worker.attemptType,
+        reportPath: worker.reportPath,
+        expectedArtifact: worker.expectedArtifact,
+        logPath: worker.logPath,
+        lastActivityAt: worker.lastActivityAt,
+        status: worker.status,
+        outcome: safeExcerpt(worker.outcome, 500),
+        stateKind: worker.status === "recovered" ? "recovered historical" : worker.status,
+        stateLabel: worker.status === "recovered" ? "Recovered / historical" : labelFromStatus(worker.status)
+    }));
+}
+function summarizeTimeline(timeline) {
+    return timeline.slice(-30).map((entry) => ({
+        at: entry.at,
+        kind: entry.kind,
+        summary: safeExcerpt(entry.summary, 700) ?? ""
+    }));
+}
+function recoveryHistory(run) {
+    const attemptEntries = Object.entries(run.recoveryAttemptsByTaskId ?? {}).map(([taskId, attempts]) => ({
+        kind: "attempt-count",
+        taskId,
+        attempts
+    }));
+    const queueEntries = run.queue
+        .filter((item) => item.source === "recovery")
+        .map((item) => ({
+        kind: "queue",
+        taskId: item.taskId,
+        originalTaskId: item.fixAttemptForTaskId,
+        status: item.status,
+        title: safeExcerpt(item.title, 240),
+        updatedAt: item.updatedAt
+    }));
+    const workerEntries = (run.workers ?? [])
+        .filter((worker) => worker.attemptType === "recovery" || worker.status === "recovered")
+        .map((worker) => ({
+        kind: "worker",
+        taskId: worker.taskId,
+        status: worker.status,
+        phase: worker.phase,
+        startedAt: worker.startedAt,
+        endedAt: worker.endedAt,
+        outcome: safeExcerpt(worker.outcome, 500)
+    }));
+    return [...attemptEntries, ...queueEntries, ...workerEntries].slice(-20);
+}
+function latestActivityAt(run) {
+    const values = [
+        run.updatedAt,
+        run.scheduler?.lastTickAt,
+        run.scheduler?.nextScheduledTickAt,
+        ...run.queue.map((item) => item.updatedAt),
+        ...(run.workers ?? []).flatMap((worker) => [worker.lastActivityAt, worker.endedAt, worker.startedAt]),
+        ...run.timeline.map((entry) => entry.at)
+    ].filter((value) => Boolean(value));
+    return values.sort().at(-1) ?? run.updatedAt;
+}
+function queueStateSummary(queue) {
+    if (!queue.length) {
+        return "Queue is empty.";
+    }
+    const counts = new Map();
+    for (const item of queue) {
+        counts.set(item.status, (counts.get(item.status) ?? 0) + 1);
+    }
+    return [...counts.entries()].map(([status, count]) => `${status}: ${count}`).join(", ");
+}
+function workerStateSummary(workers) {
+    if (!workers.length) {
+        return "No worker leases recorded.";
+    }
+    const active = workers.filter((worker) => worker.status === "active").length;
+    const recovered = workers.filter((worker) => worker.status === "recovered").length;
+    const terminal = workers.length - active;
+    return `active: ${active}, terminal: ${terminal}, recovered: ${recovered}`;
+}
+function nextStepExplanation(run) {
+    if (run.pauseReason) {
+        return `Paused or blocked: ${safeExcerpt(run.pauseReason, 500)}`;
+    }
+    if (run.stopReason) {
+        return `Stopped: ${safeExcerpt(run.stopReason, 500)}`;
+    }
+    if (run.completionSummary) {
+        return `Completed: ${safeExcerpt(run.completionSummary, 500)}`;
+    }
+    if (run.nextAction) {
+        return `Manager selected next action ${run.nextAction}.`;
+    }
+    const queued = run.queue.filter((item) => item.status === "queued").length;
+    if (queued > 0) {
+        return `${queued} queued item(s) are waiting for scheduler dispatch.`;
+    }
+    if (run.currentTaskId) {
+        return `Current task ${run.currentTaskId} is still in progress or awaiting reconciliation.`;
+    }
+    return "Waiting for the next scheduler tick or manager decision.";
+}
+function labelFromStatus(status) {
+    return status
+        .split("-")
+        .map((part) => part.slice(0, 1).toUpperCase() + part.slice(1))
+        .join(" ");
+}
+function safeExcerpt(value, maxLength = 1_000) {
+    if (!value) {
+        return value ?? undefined;
+    }
+    const redacted = value
+        .replace(/\b(api[_-]?key|token|password|secret|credential)\b\s*[:=]\s*\S+/gi, "$1=[redacted]")
+        .replace(/\b(sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,})\b/g, "[redacted]");
+    return redacted.length > maxLength ? `${redacted.slice(0, maxLength - 3)}...` : redacted;
+}
+function readLocalLauncherState() {
+    try {
+        const raw = fs.readFileSync(dataPath("local-launcher.json"), "utf8");
+        return JSON.parse(raw);
+    }
+    catch {
+        return undefined;
+    }
 }
 function limitPauseKind(run) {
     const reason = run.pauseReason ?? "";
