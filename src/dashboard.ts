@@ -681,6 +681,8 @@ export function renderDashboardHtml(): string {
         section("Codex Access Warning", task.codexAccessWarning) +
         section("Task State Explanation", task.stateExplanation) +
         section("Approval Policy", task.approval && Array.isArray(task.approval.reasons) ? task.approval.reasons.join("\\n") : "-") +
+        section("Verification Identity", verificationIdentityText(task)) +
+        section("Evidence Paths", evidencePathsText(task)) +
         section("Verification", verificationText(task)) +
         section("Risk Evidence", task.approval ? approvalEvidenceText(task.approval) : "-") +
         section("Approval Actions", approvalActions) +
@@ -837,6 +839,30 @@ export function renderDashboardHtml(): string {
           ).join("\\n")
         : "No risk evidence.";
       return "Reasons:\\n" + reasons + "\\n\\nRisk evidence:\\n" + evidence;
+    }
+
+    function evidencePathsText(task) {
+      const paths = task.evidencePaths || {};
+      return [
+        "Build report: " + text(paths.buildReport),
+        "Review report: " + text(paths.reviewReport),
+        "Canonical build: " + text(paths.canonicalBuildReport),
+        "Canonical review: " + text(paths.canonicalReviewReport),
+        "Legacy build: " + text(paths.legacyBuildReport),
+        "Legacy review: " + text(paths.legacyReviewReport)
+      ].join("\\n");
+    }
+
+    function verificationIdentityText(task) {
+      const identity = task.verificationIdentity || {};
+      return [
+        "Task ID: " + text(identity.taskId),
+        "Run ID: " + text(identity.runId),
+        "Execution root: " + text(identity.executionRoot),
+        "Branch: " + text(identity.branch),
+        "Build evidence: " + text(identity.buildEvidenceDiagnostic || "ok"),
+        "Review evidence: " + text(identity.reviewEvidenceDiagnostic || "ok")
+      ].join("\\n");
     }
 
     function verificationText(task) {

@@ -89,12 +89,9 @@ const RISK_PATTERNS: Array<{ flag: RiskFlag; patterns: RegExp[] }> = [
   }
 ];
 
-const PASSED_RESULT_PATTERN = /\b(?:result|status|final status)\s*:\s*passed\b/i;
-const FAILED_RESULT_PATTERN = /\b(?:result|status|final status)\s*:\s*(?:failed|error|blocked)\b/i;
-const INLINE_PASSED_RESULT_PATTERN = /`[^`]+`\s*[-:]\s*passed\b/i;
-const INLINE_FAILED_RESULT_PATTERN = /`[^`]+`\s*[-:]\s*(?:failed|error|blocked)\b/i;
 const NO_COMMANDS_PATTERN = /\bno\s+(?:test|check|lint|build|configured|available|npm|package\.json)[^\n]*(?:command|commands|available|configuration|exists)/i;
 const COMMAND_KEYWORDS = /\b(test|check|lint|build)\b/i;
+const COMMAND_RESULT_PREFIX = "PROJECT_PILOT_COMMAND_RESULT";
 
 export function approvalMode(): ApprovalMode {
   return process.env.PROJECT_PILOT_APPROVAL_MODE === "manual_approval_required"
@@ -180,21 +177,25 @@ export function parseVerificationRecords(options: {
 
   const records: VerificationRecord[] = [];
   const attempts = new Map<string, number>();
-  for (const block of commandBlocks(options.buildReport)) {
-    const command = extractCommand(block);
-    if (!command || !configured.some((configuredCommand) => sameCommand(configuredCommand, command))) {
+  const parsed = structuredCommandResults(options.buildReport);
+  if (!parsed.ok) {
+    return [];
+  }
+  for (const result of parsed.results) {
+    const command = result.command;
+    if (!configured.some((configuredCommand) => sameCommand(configuredCommand, command))) {
       continue;
     }
     const canonicalCommand = configured.find((configuredCommand) => sameCommand(configuredCommand, command)) ?? command;
-    const attempt = (attempts.get(canonicalCommand) ?? 0) + 1;
+    const attempt = result.attempt ?? (attempts.get(canonicalCommand) ?? 0) + 1;
     attempts.set(canonicalCommand, attempt);
     records.push({
       command: canonicalCommand,
       attempt,
-      startedAt: options.startedAt,
-      endedAt: options.endedAt,
-      exitCode: resultStatus(block) === "passed" ? 0 : resultStatus(block) === "failed" ? 1 : null,
-      status: resultStatus(block),
+      startedAt: result.startedAt ?? options.startedAt,
+      endedAt: result.endedAt ?? options.endedAt,
+      exitCode: typeof result.exitCode === "number" ? result.exitCode : result.status === "passed" ? 0 : result.status === "failed" ? 1 : null,
+      status: result.status,
       outputRef: options.outputRef,
       isCurrent: false,
       ...(options.evidence ? { evidence: options.evidence } : {})
@@ -223,6 +224,8 @@ export function parseStrictBuildVerificationEvidence(options: {
   outputRef: string;
   expectedOutputRef: string;
   configuredCommands: string[];
+  expectedRunId?: string | null;
+  expectedBranch?: string;
   startedAt?: string;
   endedAt?: string;
   recordedAt: string;
@@ -243,15 +246,19 @@ export function parseStrictBuildVerificationEvidence(options: {
       records: unknownRecords(options, configuredCommands)
     };
   }
-  const taskIds = [...options.buildReport.matchAll(/\bTask ID:\s*(task-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-[a-f0-9]{8})\b/gi)].map(
-    (match) => match[1]
-  );
-  const uniqueTaskIds = [...new Set(taskIds)];
-  if (uniqueTaskIds.length !== 1 || uniqueTaskIds[0] !== options.taskId) {
-    const found = uniqueTaskIds.length > 0 ? uniqueTaskIds.join(", ") : "none";
+  const identity = validateReportIdentity({
+    report: options.buildReport,
+    reportType: "build",
+    taskId: options.taskId,
+    runId: options.expectedRunId,
+    executionRoot: options.executionRoot,
+    branch: options.expectedBranch,
+    reportPath: options.outputRef
+  });
+  if (!identity.ok) {
     return {
       ok: false,
-      reason: `BUILD_REPORT.md task identity mismatch. Expected ${options.taskId}; found ${found}.`,
+      reason: identity.reason,
       records: unknownRecords(options, configuredCommands)
     };
   }
@@ -263,7 +270,14 @@ export function parseStrictBuildVerificationEvidence(options: {
     };
   }
 
-  const blocks = commandBlocks(options.buildReport);
+  const commandResults = structuredCommandResults(options.buildReport);
+  if (!commandResults.ok) {
+    return {
+      ok: false,
+      reason: commandResults.reason,
+      records: unknownRecords(options, configuredCommands)
+    };
+  }
   const records = parseVerificationRecords({
     buildReport: options.buildReport,
     configuredCommands,
@@ -280,7 +294,7 @@ export function parseStrictBuildVerificationEvidence(options: {
       explanation: strictEvidenceExplanation(options.source ?? "reconciled-from-evidence")
     }
   });
-  const extractedCommands = uniqueCommands(blocks.map(extractCommand));
+  const extractedCommands = uniqueCommands(commandResults.results.map((result) => result.command));
   const unexpectedCommands = extractedCommands.filter((command) => !configuredCommands.some((expected) => sameCommand(expected, command)));
   const missingCommands = configuredCommands.filter((command) => !extractedCommands.some((actual) => sameCommand(actual, command)));
   if (unexpectedCommands.length > 0 || missingCommands.length > 0) {
@@ -351,6 +365,11 @@ function extractFinalStatuses(buildReport: string): string[] {
   const statuses: string[] = [];
   const lines = buildReport.split(/\r?\n/);
   for (let index = 0; index < lines.length; index += 1) {
+    const inline = lines[index].trim().match(/^Final Status:\s*(passed|failed|blocked|unknown)\b/i);
+    if (inline) {
+      statuses.push(inline[1].toLowerCase());
+      continue;
+    }
     if (!/^##\s+Final Status\s*$/i.test(lines[index].trim())) {
       continue;
     }
@@ -360,6 +379,80 @@ function extractFinalStatuses(buildReport: string): string[] {
     }
   }
   return statuses;
+}
+
+type ReportIdentityResult = { ok: true } | { ok: false; reason: string };
+
+function validateReportIdentity(options: {
+  report: string;
+  reportType: "build" | "review";
+  taskId: string;
+  runId?: string | null;
+  executionRoot: string;
+  branch?: string;
+  reportPath: string;
+}): ReportIdentityResult {
+  const foundType = requiredReportField(options.report, "Report Type");
+  if (foundType !== options.reportType) {
+    return { ok: false, reason: `BUILD_REPORT.md report type mismatch. Expected ${options.reportType}; found ${foundType ?? "none"}.` };
+  }
+
+  const foundTaskId = requiredReportField(options.report, "Task ID");
+  if (foundTaskId !== options.taskId) {
+    const belongs = foundTaskId ? ` This report belongs to ${foundTaskId}, so it cannot verify this task.` : "";
+    return {
+      ok: false,
+      reason: `BUILD_REPORT.md task identity mismatch. Expected ${options.taskId}; found ${foundTaskId ?? "none"}.${belongs}`
+    };
+  }
+
+  const foundRunId = requiredReportField(options.report, "Run ID");
+  if (options.runId !== undefined) {
+    const expectedRunId = options.runId ?? "none";
+    if ((foundRunId ?? "none") !== expectedRunId) {
+      return { ok: false, reason: `BUILD_REPORT.md run identity mismatch. Expected ${expectedRunId}; found ${foundRunId ?? "none"}.` };
+    }
+  } else if (!foundRunId) {
+    return { ok: false, reason: "BUILD_REPORT.md is missing Run ID provenance." };
+  }
+
+  const foundExecutionRoot = requiredReportField(options.report, "Execution Root");
+  if (!foundExecutionRoot || !samePath(foundExecutionRoot, options.executionRoot)) {
+    return {
+      ok: false,
+      reason: `BUILD_REPORT.md execution root mismatch. Expected ${options.executionRoot}; found ${foundExecutionRoot ?? "none"}.`
+    };
+  }
+
+  const foundBranch = requiredReportField(options.report, "Branch");
+  if (options.branch && foundBranch !== options.branch) {
+    return { ok: false, reason: `BUILD_REPORT.md branch mismatch. Expected ${options.branch}; found ${foundBranch ?? "none"}.` };
+  }
+  if (!foundBranch) {
+    return { ok: false, reason: "BUILD_REPORT.md is missing Branch provenance." };
+  }
+
+  const foundTimestamp = requiredReportField(options.report, "Timestamp");
+  if (!foundTimestamp || Number.isNaN(Date.parse(foundTimestamp))) {
+    return { ok: false, reason: `BUILD_REPORT.md timestamp is missing or invalid. Found ${foundTimestamp ?? "none"}.` };
+  }
+
+  const foundReportPath = requiredReportField(options.report, "Report Path");
+  if (!foundReportPath || !samePath(foundReportPath, options.reportPath)) {
+    return {
+      ok: false,
+      reason: `BUILD_REPORT.md report path mismatch. Expected ${options.reportPath}; found ${foundReportPath ?? "none"}.`
+    };
+  }
+
+  return { ok: true };
+}
+
+function requiredReportField(report: string, field: string): string | undefined {
+  const escaped = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const values = [...report.matchAll(new RegExp(`^${escaped}:\\s*(.+?)\\s*$`, "gim"))].map((match) => match[1].trim());
+  const unique = [...new Set(values)];
+  return unique.length === 1 ? unique[0] : undefined;
 }
 
 export function assertNoRiskFlagsForManualApproval(decision: ApprovalDecision): void {
@@ -720,7 +813,11 @@ function evaluateCommandEvidence(options: {
     return { ok: false, reason: "BUILD_REPORT.md is missing, so configured command results cannot be verified." };
   }
 
-  const relevantBlocks = commandBlocks(options.buildReport).filter((block) => COMMAND_KEYWORDS.test(block));
+  const parsed = structuredCommandResults(options.buildReport);
+  if (!parsed.ok) {
+    return { ok: false, reason: parsed.reason };
+  }
+  const relevantBlocks = parsed.results.filter((result) => COMMAND_KEYWORDS.test(result.command));
 
   if (relevantBlocks.length === 0) {
     if (NO_COMMANDS_PATTERN.test(options.buildReport)) {
@@ -729,7 +826,7 @@ function evaluateCommandEvidence(options: {
     return { ok: false, reason: "No configured test/check/lint/build command evidence was found." };
   }
 
-  const failed = relevantBlocks.filter((block) => !PASSED_RESULT_PATTERN.test(block) && !NO_COMMANDS_PATTERN.test(block));
+  const failed = relevantBlocks.filter((result) => result.status !== "passed");
   if (failed.length > 0) {
     return { ok: false, reason: "One or more configured test/check/lint/build commands did not have a passed result." };
   }
@@ -737,28 +834,56 @@ function evaluateCommandEvidence(options: {
   return { ok: true };
 }
 
-function commandBlocks(buildReport: string): string[] {
-  return [...buildReport.matchAll(/-\s+`[\s\S]*?(?=\r?\n-\s+`|\r?\n## |\s*$)/g)].map((match) => match[0]);
-}
+type StructuredCommandResult =
+  | { ok: true; results: Array<{ command: string; status: VerificationStatus; attempt?: number; exitCode?: number | null; startedAt?: string; endedAt?: string }> }
+  | { ok: false; reason: string };
 
-function extractCommand(block: string): string | undefined {
-  return block.match(/-\s+`([^`]+)`/)?.[1]?.trim();
-}
+function structuredCommandResults(buildReport: string): StructuredCommandResult {
+  const results: Array<{
+    command: string;
+    status: VerificationStatus;
+    attempt?: number;
+    exitCode?: number | null;
+    startedAt?: string;
+    endedAt?: string;
+  }> = [];
 
-function resultStatus(block: string): VerificationStatus {
-  if (FAILED_RESULT_PATTERN.test(block)) {
-    return "failed";
+  for (const [index, line] of buildReport.split(/\r?\n/).entries()) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith(COMMAND_RESULT_PREFIX)) {
+      continue;
+    }
+    const jsonText = trimmed.slice(COMMAND_RESULT_PREFIX.length).trim();
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(jsonText);
+    } catch {
+      return { ok: false, reason: `Malformed structured command result at line ${index + 1}.` };
+    }
+    if (!parsed || typeof parsed !== "object") {
+      return { ok: false, reason: `Malformed structured command result at line ${index + 1}.` };
+    }
+    const record = parsed as Record<string, unknown>;
+    const command = typeof record.command === "string" ? record.command.trim() : "";
+    const status = typeof record.status === "string" ? record.status.trim().toLowerCase() : "";
+    if (!command || (status !== "passed" && status !== "failed" && status !== "unknown")) {
+      return { ok: false, reason: `Malformed structured command result at line ${index + 1}: command and status are required.` };
+    }
+    results.push({
+      command,
+      status: status as VerificationStatus,
+      ...(typeof record.attempt === "number" && Number.isInteger(record.attempt) && record.attempt > 0 ? { attempt: record.attempt } : {}),
+      ...(typeof record.exitCode === "number" || record.exitCode === null ? { exitCode: record.exitCode } : {}),
+      ...(typeof record.startedAt === "string" && record.startedAt.trim() ? { startedAt: record.startedAt.trim() } : {}),
+      ...(typeof record.endedAt === "string" && record.endedAt.trim() ? { endedAt: record.endedAt.trim() } : {})
+    });
   }
-  if (INLINE_FAILED_RESULT_PATTERN.test(block)) {
-    return "failed";
+
+  if (results.length === 0) {
+    return { ok: false, reason: "No structured command-result records were found in BUILD_REPORT.md." };
   }
-  if (PASSED_RESULT_PATTERN.test(block)) {
-    return "passed";
-  }
-  if (INLINE_PASSED_RESULT_PATTERN.test(block)) {
-    return "passed";
-  }
-  return "unknown";
+
+  return { ok: true, results };
 }
 
 function uniqueCommands(commands: Array<string | undefined>): string[] {

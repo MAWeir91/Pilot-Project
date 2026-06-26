@@ -31,6 +31,19 @@ export function reviewReportFile(projectRoot: string): string {
   return path.join(projectRoot, "REVIEW_REPORT.md");
 }
 
+export function taskReportsDir(projectRoot: string, taskId: string): string {
+  assertTaskIdPathSegment(taskId);
+  return path.join(projectRoot, ".project-pilot", "reports", taskId);
+}
+
+export function taskBuildReportFile(projectRoot: string, taskId: string): string {
+  return path.join(taskReportsDir(projectRoot, taskId), "BUILD_REPORT.md");
+}
+
+export function taskReviewReportFile(projectRoot: string, taskId: string): string {
+  return path.join(taskReportsDir(projectRoot, taskId), "REVIEW_REPORT.md");
+}
+
 export function planReportFile(projectRoot: string): string {
   return path.join(projectRoot, "PLAN_REPORT.md");
 }
@@ -87,4 +100,10 @@ export function registeredProjectRoots(): string[] {
 
 function allowedRoots(): string[] {
   return [PROJECT_PILOT_ROOT, ...registeredProjectRoots()];
+}
+
+function assertTaskIdPathSegment(taskId: string): void {
+  if (!/^task-[a-zA-Z0-9._-]+$/.test(taskId)) {
+    throw new Error(`Invalid task ID for report path: ${taskId}`);
+  }
 }

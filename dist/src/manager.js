@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as z from "zod/v4";
 import { evaluateApprovalPolicy } from "./approval-policy.js";
 import { buildAutopilotAuditSummary } from "./audit.js";
-import { buildReportFile, reviewReportFile } from "./paths.js";
+import { taskBuildReportFile, taskReviewReportFile } from "./paths.js";
 import { maintenanceStatus, maintenanceStatusFromError, taskArtifactRoot } from "./execution.js";
 import { ProjectRegistry } from "./projects.js";
 import { StateStore } from "./state.js";
@@ -681,7 +681,7 @@ export class AutopilotService {
                 attemptType: "manager",
                 command: "codex review worker",
                 startedAt: this.now(),
-                reportPath: reviewReportFile(taskArtifactRoot(project)),
+                reportPath: taskReviewReportFile(taskArtifactRoot(project), reconciled.id),
                 expectedArtifact: "REVIEW_REPORT.md"
             });
             await this.updateRun(run.id, (existing) => ({
@@ -1060,7 +1060,7 @@ export class AutopilotService {
                 attemptType: next.source === "recovery" ? "recovery" : next.source === "fix" ? "reviewer-fix" : "manager",
                 command: "codex build worker",
                 startedAt: this.now(),
-                reportPath: buildReportFile(taskArtifactRoot(project)),
+                reportPath: taskBuildReportFile(taskArtifactRoot(project), prepared.task.id),
                 expectedArtifact: "BUILD_REPORT.md"
             });
             await this.store.transaction((state) => {
@@ -1083,7 +1083,7 @@ export class AutopilotService {
             attemptType: next.source === "recovery" ? "recovery" : next.source === "fix" ? "reviewer-fix" : "manager",
             command: "codex build worker",
             startedAt: this.now(),
-            reportPath: buildReportFile(taskArtifactRoot(project)),
+            reportPath: taskBuildReportFile(taskArtifactRoot(project), started.taskId),
             expectedArtifact: "BUILD_REPORT.md"
         });
         await this.updateRun(runId, (existing) => launchQueuedTaskRunState(existing, next, started.taskId, lease, this.now()));

@@ -387,7 +387,7 @@ describe("maintenance execution isolation", () => {
         dirtyWorkingTreeReason: dirtyReason
       },
       gitRunner: validMaintenanceGitRunner("feature/self-improvement-dashboard-workflow-v1", undefined, undefined, () =>
-        " M TASK.md\n?? .project-pilot/logs/task.build.jsonl\n?? BUILD_REPORT.md\n"
+        " M TASK.md\n?? .project-pilot/logs/task.build.jsonl\n?? .project-pilot/reports/task/BUILD_REPORT.md\n"
       )
     });
     const autopilot = autopilotForMaintenance({ service, registry, store });
@@ -551,7 +551,9 @@ describe("maintenance execution isolation", () => {
 
     expect(spawnJob.mock.calls[0][0]).toMatchObject({ projectRoot: executionRoot });
     const runs = await store.listAutopilotRuns();
-    expect(runs[0]?.workers?.[0]?.reportPath).toBe(path.join(executionRoot, "BUILD_REPORT.md"));
+    expect(runs[0]?.workers?.[0]?.reportPath).toBe(
+      path.join(executionRoot, ".project-pilot", "reports", String(runs[0]?.workers?.[0]?.taskId), "BUILD_REPORT.md")
+    );
   });
 
   it("exposes dashboard-safe maintenance status without leaking secrets", async () => {

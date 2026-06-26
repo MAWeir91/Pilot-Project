@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
-import { buildReportFile, planReportFile, reviewReportFile, taskFile, assertAllowedPath } from "./paths.js";
+import path from "node:path";
+import { buildReportFile, planReportFile, reviewReportFile, taskBuildReportFile, taskReportsDir, taskReviewReportFile, taskFile, assertAllowedPath } from "./paths.js";
 import { CODEX_ACCESS_MODE, CODEX_ACCESS_WARNING, CODEX_APPROVAL_POLICY, assertPlanId, buildLogPath, buildPlanLogPath, createPlanId, createTaskId, spawnCodexJob, assertTaskId } from "./codex.js";
 import { readLogTail, readTextIfExists, extractPlanReport, extractReviewReport } from "./logs.js";
 import { buildPrompt, planPrompt, renderTaskMarkdown, reviewPrompt } from "./prompts.js";
@@ -128,7 +129,7 @@ export class JobService {
         await this.reconcileTask(taskId);
         const task = await this.requireTask(taskId);
         const project = await this.projectForTask(task);
-        const buildReport = await readTextIfExists(buildReportFile(taskArtifactRoot(project)));
+        const buildEvidence = await this.readBuildEvidence(task, project);
         return {
             taskId,
             status: task.build.status,
@@ -138,7 +139,11 @@ export class JobService {
             exitCode: task.build.exitCode,
             error: task.build.error,
             logTail: await readLogTail(task.build.logPath),
-            buildReport: buildReport ?? null
+            buildReport: buildEvidence.report ?? null,
+            buildReportPath: buildEvidence.path,
+            canonicalBuildReportPath: taskBuildReportFile(taskArtifactRoot(project), task.id),
+            legacyBuildReportPath: buildReportFile(taskArtifactRoot(project)),
+            evidenceDiagnostic: buildEvidence.diagnostic
         };
     }
     async listTasks() {
@@ -297,6 +302,8 @@ export class JobService {
         const task = await this.requireTask(taskId);
         const project = await this.projectForTask(task);
         const approval = await this.evaluateTaskApproval(taskId);
+        const buildEvidence = await this.readBuildEvidence(task, project);
+        const reviewEvidence = await this.readReviewEvidence(task, project);
         return {
             ...(await this.toTaskSummary(task)),
             requirements: task.requirements,
@@ -305,11 +312,27 @@ export class JobService {
             errors: collectErrors(task),
             buildLog: (await readTextIfExists(task.build.logPath)) ?? "",
             reviewLog: task.review?.logPath ? (await readTextIfExists(task.review.logPath)) ?? "" : "",
-            buildReport: (await readTextIfExists(buildReportFile(taskArtifactRoot(project)))) ?? null,
-            reviewReport: (await readTextIfExists(reviewReportFile(taskArtifactRoot(project)))) ?? null,
+            buildReport: buildEvidence.report ?? null,
+            reviewReport: reviewEvidence.report ?? null,
             verification: task.verification ?? [],
             verificationEvents: task.verificationEvents ?? [],
             approvalActions: task.approvalActions ?? [],
+            evidencePaths: {
+                buildReport: buildEvidence.path,
+                reviewReport: reviewEvidence.path,
+                canonicalBuildReport: taskBuildReportFile(taskArtifactRoot(project), task.id),
+                canonicalReviewReport: taskReviewReportFile(taskArtifactRoot(project), task.id),
+                legacyBuildReport: buildReportFile(taskArtifactRoot(project)),
+                legacyReviewReport: reviewReportFile(taskArtifactRoot(project))
+            },
+            verificationIdentity: {
+                taskId: task.id,
+                runId: (await this.findRunForTask(task.id))?.id ?? null,
+                executionRoot: taskArtifactRoot(project),
+                branch: this.branchForEvidence(project),
+                buildEvidenceDiagnostic: buildEvidence.diagnostic,
+                reviewEvidenceDiagnostic: reviewEvidence.diagnostic
+            },
             approval
         };
     }
@@ -668,6 +691,10 @@ export class JobService {
         let child;
         let finalized = false;
         let timeout;
+        const reportPath = taskBuildReportFile(taskArtifactRoot(project), taskId);
+        const runId = (await this.findRunForTask(taskId))?.id ?? null;
+        const branch = this.branchForEvidence(project);
+        await fs.mkdir(assertAllowedPath(taskReportsDir(taskArtifactRoot(project), taskId)), { recursive: true });
         const finalize = async (status, exitCode, error) => {
             if (finalized) {
                 return;
@@ -703,7 +730,11 @@ export class JobService {
                 sandbox: "danger-full-access",
                 prompt: buildPrompt(taskId, {
                     executionRoot: taskArtifactRoot(project),
-                    configuredCommands: projectVerificationCommands(project)
+                    configuredCommands: projectVerificationCommands(project),
+                    reportPath,
+                    runId,
+                    branch,
+                    timestamp: this.now()
                 }),
                 logPath,
                 onError: (error) => {
@@ -749,6 +780,11 @@ export class JobService {
         let child;
         let finalized = false;
         let timeout;
+        const buildReportPath = taskBuildReportFile(taskArtifactRoot(project), taskId);
+        const reviewReportPath = taskReviewReportFile(taskArtifactRoot(project), taskId);
+        const runId = (await this.findRunForTask(taskId))?.id ?? null;
+        const branch = this.branchForEvidence(project);
+        await fs.mkdir(assertAllowedPath(taskReportsDir(taskArtifactRoot(project), taskId)), { recursive: true });
         const finalize = async (result, exitCode, report, error) => {
             if (finalized) {
                 return;
@@ -764,7 +800,14 @@ export class JobService {
             child = this.spawnJob({
                 projectRoot: taskArtifactRoot(project),
                 sandbox: "danger-full-access",
-                prompt: reviewPrompt(taskId),
+                prompt: reviewPrompt(taskId, {
+                    executionRoot: taskArtifactRoot(project),
+                    buildReportPath,
+                    reviewReportPath,
+                    runId,
+                    branch,
+                    timestamp: this.now()
+                }),
                 logPath,
                 onError: (error) => {
                     void finalize("blocked", null, undefined, `Failed to spawn or run Codex review: ${error.message}`);
@@ -909,7 +952,8 @@ export class JobService {
     }
     async applyReviewResult(taskId, project, logPath, result, exitCode, report, error) {
         if (report) {
-            await fs.writeFile(assertAllowedPath(reviewReportFile(taskArtifactRoot(project))), report, "utf8");
+            await fs.mkdir(assertAllowedPath(taskReportsDir(taskArtifactRoot(project), taskId)), { recursive: true });
+            await fs.writeFile(assertAllowedPath(taskReviewReportFile(taskArtifactRoot(project), taskId)), report, "utf8");
         }
         const reviewStatus = result === "pass" ? "passed" : result === "needs-fixes" ? "failed" : "blocked";
         const taskStatus = result === "pass" ? "ready-for-approval" : result === "needs-fixes" ? "needs-fixes" : "blocked";
@@ -992,8 +1036,10 @@ export class JobService {
         }));
     }
     async readMatchingReviewResult(taskId, project) {
-        const report = await readTextIfExists(reviewReportFile(taskArtifactRoot(project)));
-        if (!report || !report.includes(`Task ID: ${taskId}`)) {
+        const task = await this.requireTask(taskId);
+        const evidence = await this.readReviewEvidence(task, project);
+        const report = evidence.report;
+        if (!report || !evidence.trustedForPolicy) {
             return undefined;
         }
         const match = report.match(/Result:\s*(pass|needs-fixes|blocked)\b/i);
@@ -1056,6 +1102,110 @@ export class JobService {
         const runs = await this.store.listAutopilotRuns();
         return runs.find((run) => run.currentTaskId === taskId || run.queue.some((item) => item.taskId === taskId || item.fixAttemptForTaskId === taskId));
     }
+    async readBuildEvidence(task, project) {
+        return await this.readTaskEvidence(task, project, "build");
+    }
+    async readReviewEvidence(task, project) {
+        return await this.readTaskEvidence(task, project, "review");
+    }
+    async readTaskEvidence(task, project, reportType) {
+        const root = taskArtifactRoot(project);
+        const canonicalPath = reportType === "build" ? taskBuildReportFile(root, task.id) : taskReviewReportFile(root, task.id);
+        const legacyPath = reportType === "build" ? buildReportFile(root) : reviewReportFile(root);
+        const runId = (await this.findRunForTask(task.id))?.id ?? null;
+        const branch = this.branchForEvidence(project);
+        const canonicalReport = await readTextIfExists(canonicalPath);
+        if (canonicalReport !== undefined) {
+            const validation = this.validateTaskReportIdentity(canonicalReport, {
+                reportType,
+                task,
+                project,
+                runId,
+                branch,
+                reportPath: canonicalPath
+            });
+            return {
+                report: canonicalReport,
+                path: canonicalPath,
+                trustedForPolicy: validation.ok,
+                diagnostic: validation.ok ? undefined : validation.reason
+            };
+        }
+        const legacyReport = await readTextIfExists(legacyPath);
+        if (legacyReport !== undefined) {
+            const validation = this.validateTaskReportIdentity(legacyReport, {
+                reportType,
+                task,
+                project,
+                runId,
+                branch,
+                reportPath: legacyPath
+            });
+            return {
+                report: legacyReport,
+                path: legacyPath,
+                trustedForPolicy: validation.ok,
+                diagnostic: validation.ok
+                    ? `Using legacy shared ${pathBasename(legacyPath)} because canonical task-scoped evidence is missing at ${canonicalPath}.`
+                    : `Rejected legacy shared ${pathBasename(legacyPath)}. ${validation.reason} Canonical task-scoped evidence belongs at ${canonicalPath}.`
+            };
+        }
+        return {
+            path: canonicalPath,
+            trustedForPolicy: false,
+            diagnostic: `No canonical ${pathBasename(canonicalPath)} found for task ${task.id}. Canonical task-scoped evidence belongs at ${canonicalPath}.`
+        };
+    }
+    validateTaskReportIdentity(report, options) {
+        const label = options.reportType === "build" ? "BUILD_REPORT.md" : "REVIEW_REPORT.md";
+        const reportType = reportField(report, "Report Type");
+        if (reportType !== options.reportType) {
+            return { ok: false, reason: `${label} report type mismatch. Expected ${options.reportType}; found ${reportType ?? "none"}.` };
+        }
+        const taskId = reportField(report, "Task ID");
+        if (taskId !== options.task.id) {
+            const belongs = taskId ? ` This report belongs to ${taskId}, so it cannot verify this task.` : "";
+            return { ok: false, reason: `${label} task identity mismatch. Expected ${options.task.id}; found ${taskId ?? "none"}.${belongs}` };
+        }
+        const runId = reportField(report, "Run ID");
+        const expectedRunId = options.runId ?? "none";
+        if ((runId ?? "none") !== expectedRunId) {
+            return { ok: false, reason: `${label} run identity mismatch. Expected ${expectedRunId}; found ${runId ?? "none"}.` };
+        }
+        const executionRoot = reportField(report, "Execution Root");
+        if (!executionRoot || !samePathText(executionRoot, taskArtifactRoot(options.project))) {
+            return {
+                ok: false,
+                reason: `${label} execution root mismatch. Expected ${taskArtifactRoot(options.project)}; found ${executionRoot ?? "none"}.`
+            };
+        }
+        const branch = reportField(report, "Branch");
+        if (branch !== options.branch) {
+            return { ok: false, reason: `${label} branch mismatch. Expected ${options.branch}; found ${branch ?? "none"}.` };
+        }
+        const timestamp = reportField(report, "Timestamp");
+        if (!timestamp || Number.isNaN(Date.parse(timestamp))) {
+            return { ok: false, reason: `${label} timestamp is missing or invalid. Found ${timestamp ?? "none"}.` };
+        }
+        const reportPath = reportField(report, "Report Path");
+        if (!reportPath || !samePathText(reportPath, options.reportPath)) {
+            return { ok: false, reason: `${label} report path mismatch. Expected ${options.reportPath}; found ${reportPath ?? "none"}.` };
+        }
+        return { ok: true };
+    }
+    branchForEvidence(project) {
+        const root = taskArtifactRoot(project);
+        try {
+            const branch = this.gitRunner?.(["branch", "--show-current"], root).trim();
+            if (branch) {
+                return branch;
+            }
+        }
+        catch {
+            // Fall back to configured metadata for report identity when Git is unavailable.
+        }
+        return project.maintenance?.expectedBranch || project.defaultBranchName || "unknown";
+    }
     async recordVerificationTimelineEvent(taskId, event) {
         const run = await this.findRunForTask(taskId);
         if (!run) {
@@ -1092,8 +1242,10 @@ export class JobService {
     async evaluateTaskApproval(taskId) {
         const task = await this.reconcileVerification(taskId);
         const project = await this.projectForTask(task);
-        const buildReport = await readTextIfExists(buildReportFile(taskArtifactRoot(project)));
-        const reviewReport = await readTextIfExists(reviewReportFile(taskArtifactRoot(project)));
+        const buildEvidence = await this.readBuildEvidence(task, project);
+        const reviewEvidence = await this.readReviewEvidence(task, project);
+        const buildReport = buildEvidence.trustedForPolicy ? buildEvidence.report : null;
+        const reviewReport = reviewEvidence.trustedForPolicy ? reviewEvidence.report : null;
         return evaluateApprovalPolicy({
             task,
             buildReport,
@@ -1108,10 +1260,12 @@ export class JobService {
         if (commands.length === 0) {
             return task;
         }
-        const reportPath = buildReportFile(taskArtifactRoot(project));
-        const buildReport = await readTextIfExists(reportPath);
+        const evidence = await this.readBuildEvidence(task, project);
+        const reportPath = evidence.path;
+        const buildReport = evidence.report;
         const reportMtimeMs = await fileMtimeMs(reportPath);
         const recordedAt = this.now();
+        const runId = (await this.findRunForTask(taskId))?.id ?? null;
         const strict = source === "build-worker"
             ? parseStrictBuildVerificationEvidence({
                 buildReport,
@@ -1120,6 +1274,8 @@ export class JobService {
                 outputRef: reportPath,
                 expectedOutputRef: reportPath,
                 configuredCommands: commands,
+                expectedRunId: runId,
+                expectedBranch: this.branchForEvidence(project),
                 startedAt: task.build.startedAt,
                 endedAt: task.build.endedAt,
                 recordedAt,
@@ -1161,10 +1317,12 @@ export class JobService {
         if (commands.length === 0 || hasCompleteCurrentVerification(task.verification, commands)) {
             return task;
         }
-        const reportPath = buildReportFile(taskArtifactRoot(project));
-        const buildReport = await readTextIfExists(reportPath);
+        const evidence = await this.readBuildEvidence(task, project);
+        const reportPath = evidence.path;
+        const buildReport = evidence.report;
         const reportMtimeMs = await fileMtimeMs(reportPath);
         const recordedAt = this.now();
+        const runId = (await this.findRunForTask(taskId))?.id ?? null;
         const strict = parseStrictBuildVerificationEvidence({
             buildReport,
             taskId,
@@ -1172,6 +1330,8 @@ export class JobService {
             outputRef: reportPath,
             expectedOutputRef: reportPath,
             configuredCommands: commands,
+            expectedRunId: runId,
+            expectedBranch: this.branchForEvidence(project),
             startedAt: task.build.startedAt,
             endedAt: task.build.endedAt,
             recordedAt,
@@ -1222,6 +1382,8 @@ export class JobService {
         const latestLogPath = task.review?.logPath ?? task.build.logPath;
         const latestLogTail = await readLogTail(latestLogPath, 12);
         const project = await this.projectForTask(task);
+        const buildEvidence = await this.readBuildEvidence(task, project);
+        const reviewEvidence = await this.readReviewEvidence(task, project);
         return {
             title: task.title,
             projectId: project.id,
@@ -1236,8 +1398,8 @@ export class JobService {
             codexAccessWarning: CODEX_ACCESS_WARNING,
             approval: evaluateApprovalPolicy({
                 task,
-                buildReport: await readTextIfExists(buildReportFile(taskArtifactRoot(project))),
-                reviewReport: await readTextIfExists(reviewReportFile(taskArtifactRoot(project))),
+                buildReport: buildEvidence.trustedForPolicy ? buildEvidence.report : null,
+                reviewReport: reviewEvidence.trustedForPolicy ? reviewEvidence.report : null,
                 configuredCommands: projectVerificationCommands(project),
                 verification: task.verification
             }),
@@ -1654,6 +1816,18 @@ function kindTitle(kind) {
 }
 function errorMessage(error) {
     return error instanceof Error ? error.message : String(error);
+}
+function pathBasename(filePath) {
+    return path.basename(filePath);
+}
+function reportField(report, field) {
+    const escaped = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const values = [...report.matchAll(new RegExp(`^${escaped}:\\s*(.+?)\\s*$`, "gim"))].map((match) => match[1].trim());
+    const unique = [...new Set(values)];
+    return unique.length === 1 ? unique[0] : undefined;
+}
+function samePathText(left, right) {
+    return left.trim().replace(/[\\/]+/g, "/").toLowerCase() === right.trim().replace(/[\\/]+/g, "/").toLowerCase();
 }
 function planTaskRequirements(plan, report) {
     return [

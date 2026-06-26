@@ -3,10 +3,11 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { JobService } from "../src/jobs.js";
 import { NullTaskNotifier } from "../src/notifications.js";
-import { ALLOWLISTED_PROJECT_ROOT, dataPath } from "../src/paths.js";
+import { ALLOWLISTED_PROJECT_ROOT, dataPath, taskBuildReportFile, taskReportsDir, taskReviewReportFile } from "../src/paths.js";
 import { ProjectRegistry } from "../src/projects.js";
 import { StateStore } from "../src/state.js";
 const TASK_ID = "task-2026-06-24T03-00-00-000Z-dddddddd";
+const SECOND_TASK_ID = "task-2026-06-24T03-00-00-000Z-eeeeeeee";
 const BUILD_LOG = dataPath("task-2026-06-24T03-00-00-000Z-dddddddd.build.jsonl");
 const REVIEW_LOG = dataPath("task-2026-06-24T03-00-00-000Z-dddddddd.review.jsonl");
 const STATE_FILES = [];
@@ -44,7 +45,7 @@ describe("task approval", () => {
         "stopped"
     ])("rejects %s tasks", async (status) => {
         const { service } = await serviceWithTask(taskForStatus(status));
-        await expect(service.approveTask(TASK_ID)).rejects.toThrow(/not ready-for-approval/);
+        await expect(service.approveTask(TASK_ID)).rejects.toThrow(/not ready-for-approval|required build, verification, and review gates/);
     });
     it("does not modify target-project files", async () => {
         const before = await snapshotTargetProject();
@@ -75,7 +76,7 @@ describe("task approval", () => {
         expect(saved?.verification?.every((record) => record.evidence?.source === "build-worker")).toBe(true);
     });
     it("strictly reconciles valid legacy build evidence and records audit visibility", async () => {
-        const { service, store } = await serviceWithTask(readyTask(), { withRun: true });
+        const { service, store } = await serviceWithTask(readyTask(), { withRun: true, legacyBuildReport: true });
         const result = await service.finalizeTask(TASK_ID);
         const saved = await store.getTask(TASK_ID);
         const run = (await store.listAutopilotRuns())[0];
@@ -89,6 +90,69 @@ describe("task approval", () => {
             taskId: TASK_ID
         });
         expect(run.timeline.some((entry) => entry.summary.includes("verification reconciled-from-evidence"))).toBe(true);
+    });
+    it("does not reuse another task's canonical evidence for a later task", async () => {
+        const { service, store } = await serviceWithTwoReadyTasksWithOnlyFirstEvidence();
+        const result = await service.finalizeTask(SECOND_TASK_ID);
+        const second = await store.getTask(SECOND_TASK_ID);
+        expect(result.status).toBe("manual_approval_required");
+        expect(second?.verification?.every((record) => record.status === "unknown")).toBe(true);
+        expect(second?.verificationEvents?.[0]?.outputRef).toContain(SECOND_TASK_ID);
+        expect(second?.verificationEvents?.[0]?.explanation).toMatch(/missing|No canonical/i);
+    });
+    it("does not parse filenames or paths as command evidence", async () => {
+        const reportWithOnlyPathText = [
+            "# Build Report",
+            "",
+            "Report Type: build",
+            `Task ID: ${TASK_ID}`,
+            "Run ID: __RUN_ID__",
+            "Execution Root: __EXECUTION_ROOT__",
+            "Branch: main",
+            "Timestamp: 2026-06-24T03:10:00.000Z",
+            "Report Path: __REPORT_PATH__",
+            "",
+            "Final Status: passed",
+            "",
+            "## Notes",
+            "",
+            "- `BUILD_REPORT.md` - passed",
+            "- `.project-pilot/logs/task.build.jsonl` - passed",
+            "- `src/server.ts` - passed",
+            "- `npm test` mentioned in prose, not as a structured command record."
+        ].join("\n");
+        const { service, store } = await serviceWithTask(readyTask(), { buildReport: reportWithOnlyPathText });
+        const result = await service.finalizeTask(TASK_ID);
+        const saved = await store.getTask(TASK_ID);
+        expect(result.status).toBe("manual_approval_required");
+        expect(saved?.verificationEvents?.[0]?.explanation).toMatch(/missing commands|structured command-result/i);
+        expect(saved?.verification?.some((record) => record.command === "BUILD_REPORT.md" || record.command === "src/server.ts")).toBe(false);
+    });
+    it("rejects a report with the wrong task ID in plain English", async () => {
+        const wrongTaskId = "task-2026-06-24T03-00-00-000Z-aaaaaaaa";
+        const { service, store } = await serviceWithTask(readyTask(), { buildReport: approvalBuildReport({ taskId: wrongTaskId }) });
+        const result = await service.finalizeTask(TASK_ID);
+        const saved = await store.getTask(TASK_ID);
+        expect(result.status).toBe("manual_approval_required");
+        expect(saved?.verificationEvents?.[0]?.explanation).toContain(`This report belongs to ${wrongTaskId}, so it cannot verify this task.`);
+    });
+    it("rejects old shared reports without strict matching provenance", async () => {
+        const oldSharedReport = [
+            "# Build Report",
+            "",
+            `Task ID: ${TASK_ID}`,
+            "",
+            "- `npm test` - passed",
+            "- `npm run check` - passed",
+            "- `npm run build` - passed",
+            "",
+            "Final Status: passed"
+        ].join("\n");
+        const { service, store } = await serviceWithTask(readyTask(), { buildReport: oldSharedReport, legacyBuildReport: true });
+        const result = await service.finalizeTask(TASK_ID);
+        const saved = await store.getTask(TASK_ID);
+        expect(result.status).toBe("manual_approval_required");
+        expect(saved?.verificationEvents?.[0]?.explanation).toMatch(/report type mismatch|Run ID|Report Path/);
     });
     it("treats a later successful retry as the effective configured command result", async () => {
         const { service, store } = await serviceWithTask(readyTask(), {
@@ -188,7 +252,13 @@ describe("task approval", () => {
             reviewReport: [
                 "# Review Report",
                 "",
-                "Task ID: approval-fixture",
+                "Report Type: review",
+                `Task ID: ${TASK_ID}`,
+                "Run ID: __RUN_ID__",
+                "Execution Root: __EXECUTION_ROOT__",
+                "Branch: main",
+                "Timestamp: 2026-06-24T03:10:00.000Z",
+                "Report Path: __REPORT_PATH__",
                 "Result: pass",
                 "",
                 "No deployment behavior, payment flow, or external service integration was found."
@@ -397,8 +467,21 @@ async function serviceWithTask(task, options = {}) {
     const projectPath = dataPath(`approval-project-${suffix}`);
     STATE_FILES.push(stateFile, registryFile, projectPath);
     await fs.mkdir(projectPath, { recursive: true });
-    await fs.writeFile(path.join(projectPath, "BUILD_REPORT.md"), options.buildReport ?? approvalBuildReport(), "utf8");
-    await fs.writeFile(path.join(projectPath, "REVIEW_REPORT.md"), options.reviewReport ?? approvalReviewReport(), "utf8");
+    const runId = options.withRun ? "autopilot-approval-test" : "none";
+    const canonicalBuildPath = taskBuildReportFile(projectPath, TASK_ID);
+    const canonicalReviewPath = taskReviewReportFile(projectPath, TASK_ID);
+    const buildPath = options.legacyBuildReport ? path.join(projectPath, "BUILD_REPORT.md") : canonicalBuildPath;
+    await fs.mkdir(taskReportsDir(projectPath, TASK_ID), { recursive: true });
+    await fs.writeFile(buildPath, renderReportFixture(options.buildReport ?? approvalBuildReport(), {
+        executionRoot: projectPath,
+        reportPath: buildPath,
+        runId
+    }), "utf8");
+    await fs.writeFile(canonicalReviewPath, renderReportFixture(options.reviewReport ?? approvalReviewReport(), {
+        executionRoot: projectPath,
+        reportPath: canonicalReviewPath,
+        runId
+    }), "utf8");
     const savedTask = { ...task, projectId: "approval-project" };
     const state = { tasks: [savedTask] };
     if (options.withRun) {
@@ -424,9 +507,52 @@ async function serviceWithTask(task, options = {}) {
     });
     return { service, store };
 }
+async function serviceWithTwoReadyTasksWithOnlyFirstEvidence() {
+    await fs.writeFile(BUILD_LOG, "build log\n", "utf8");
+    await fs.writeFile(REVIEW_LOG, "review log\n", "utf8");
+    const suffix = STATE_FILES.length;
+    const stateFile = dataPath(`approval-two-tasks-${suffix}.json`);
+    const registryFile = dataPath(`approval-two-task-projects-${suffix}.json`);
+    const projectPath = dataPath(`approval-two-task-project-${suffix}`);
+    STATE_FILES.push(stateFile, registryFile, projectPath);
+    await fs.mkdir(projectPath, { recursive: true });
+    const firstBuildPath = taskBuildReportFile(projectPath, TASK_ID);
+    await fs.mkdir(taskReportsDir(projectPath, TASK_ID), { recursive: true });
+    await fs.writeFile(firstBuildPath, renderReportFixture(approvalBuildReport(), {
+        executionRoot: projectPath,
+        reportPath: firstBuildPath,
+        runId: "none"
+    }), "utf8");
+    const first = { ...readyTask(), projectId: "approval-two-task-project" };
+    const second = { ...readyTaskFor(SECOND_TASK_ID), projectId: "approval-two-task-project" };
+    await fs.writeFile(stateFile, `${JSON.stringify({ tasks: [second, first] }, null, 2)}\n`, "utf8");
+    const store = new StateStore(stateFile);
+    const projects = new ProjectRegistry(registryFile, () => "2026-06-24T03:10:00.000Z");
+    await projects.registerProject({
+        id: "approval-two-task-project",
+        name: "Approval Two Task Project",
+        path: projectPath,
+        buildCommand: "npm run build",
+        testCommand: "npm test",
+        checkCommand: "npm run check",
+        defaultBranchName: "main",
+        allowedGitBehavior: "feature branches, descriptive commits, non-protected branch pushes, and draft pull requests"
+    });
+    const service = new JobService(store, new NullTaskNotifier(), {
+        projects,
+        now: () => "2026-06-24T03:10:00.000Z"
+    });
+    return { service, store };
+}
 function omitBuildReportOption(options) {
-    const { buildReport: _buildReport, reviewReport: _reviewReport, withRun: _withRun, ...rest } = options;
+    const { buildReport: _buildReport, reviewReport: _reviewReport, withRun: _withRun, legacyBuildReport: _legacyBuildReport, ...rest } = options;
     return rest;
+}
+function renderReportFixture(report, values) {
+    return report
+        .replaceAll("__EXECUTION_ROOT__", values.executionRoot)
+        .replaceAll("__REPORT_PATH__", values.reportPath)
+        .replaceAll("__RUN_ID__", values.runId);
 }
 function approvalRun() {
     return {
@@ -458,65 +584,70 @@ function approvalRun() {
 }
 function approvalBuildReport(options = {}) {
     const commands = [
-        ["npm test", "passed; test suite completed."],
-        ["npm run check", "passed; lint and typecheck completed."],
-        ["npm run build", "passed; production build completed."]
+        ["npm test", "passed"],
+        ["npm run check", "passed"],
+        ["npm run build", "passed"]
     ].filter(([command]) => command !== options.omitCommand);
     return [
         "# Build Report",
         "",
+        "Report Type: build",
         `Task ID: ${options.taskId ?? TASK_ID}`,
+        "Run ID: __RUN_ID__",
+        "Execution Root: __EXECUTION_ROOT__",
+        "Branch: main",
+        "Timestamp: 2026-06-24T03:10:00.000Z",
+        "Report Path: __REPORT_PATH__",
         "",
         "## Commands Run and Results",
         "",
-        ...commands.flatMap(([command, result]) => [`- \`${command}\``, `  - Result: ${result}`]),
+        ...commands.map(([command, result], index) => `PROJECT_PILOT_COMMAND_RESULT {"command":${JSON.stringify(command)},"attempt":1,"status":${JSON.stringify(result)},"exitCode":0,"startedAt":"2026-06-24T03:0${index}:01.000Z","endedAt":"2026-06-24T03:0${index}:02.000Z"}`),
         "",
-        "## Final Status",
-        "",
-        "passed",
-        ...(options.extraFinalStatus ? ["", "## Final Status", "", options.extraFinalStatus] : [])
+        "Final Status: passed",
+        ...(options.extraFinalStatus ? ["", `Final Status: ${options.extraFinalStatus}`] : [])
     ].join("\n");
 }
 function approvalBuildReportWithTestRetry() {
     return [
         "# Build Report",
         "",
+        "Report Type: build",
         `Task ID: ${TASK_ID}`,
+        "Run ID: __RUN_ID__",
+        "Execution Root: __EXECUTION_ROOT__",
+        "Branch: main",
+        "Timestamp: 2026-06-24T03:10:00.000Z",
+        "Report Path: __REPORT_PATH__",
         "",
         "## Commands Run and Results",
         "",
-        "- `npm test`",
-        "  - Result: failed initially; 15 tests passed and 1 assertion failed.",
-        "- `npm test`",
-        "  - Result: passed after correcting the assertion; 16 tests passed.",
-        "- `npm run check`",
-        "  - Result: passed; lint and typecheck completed.",
-        "- `npm run build`",
-        "  - Result: passed; production build completed.",
+        'PROJECT_PILOT_COMMAND_RESULT {"command":"npm test","attempt":1,"status":"failed","exitCode":1}',
+        'PROJECT_PILOT_COMMAND_RESULT {"command":"npm test","attempt":2,"status":"passed","exitCode":0}',
+        'PROJECT_PILOT_COMMAND_RESULT {"command":"npm run check","attempt":1,"status":"passed","exitCode":0}',
+        'PROJECT_PILOT_COMMAND_RESULT {"command":"npm run build","attempt":1,"status":"passed","exitCode":0}',
         "",
-        "## Final Status",
-        "",
-        "passed"
+        "Final Status: passed"
     ].join("\n");
 }
 function approvalBuildReportWithFailedTestOnly() {
     return [
         "# Build Report",
         "",
+        "Report Type: build",
         `Task ID: ${TASK_ID}`,
+        "Run ID: __RUN_ID__",
+        "Execution Root: __EXECUTION_ROOT__",
+        "Branch: main",
+        "Timestamp: 2026-06-24T03:10:00.000Z",
+        "Report Path: __REPORT_PATH__",
         "",
         "## Commands Run and Results",
         "",
-        "- `npm test`",
-        "  - Result: failed; 15 tests passed and 1 assertion failed.",
-        "- `npm run check`",
-        "  - Result: passed; lint and typecheck completed.",
-        "- `npm run build`",
-        "  - Result: passed; production build completed.",
+        'PROJECT_PILOT_COMMAND_RESULT {"command":"npm test","attempt":1,"status":"failed","exitCode":1}',
+        'PROJECT_PILOT_COMMAND_RESULT {"command":"npm run check","attempt":1,"status":"passed","exitCode":0}',
+        'PROJECT_PILOT_COMMAND_RESULT {"command":"npm run build","attempt":1,"status":"passed","exitCode":0}',
         "",
-        "## Final Status",
-        "",
-        "failed"
+        "Final Status: failed"
     ].join("\n");
 }
 function durableVerification(status = "passed") {
@@ -544,7 +675,13 @@ function approvalReviewReport() {
     return [
         "# Review Report",
         "",
-        "Task ID: approval-fixture",
+        "Report Type: review",
+        `Task ID: ${TASK_ID}`,
+        "Run ID: __RUN_ID__",
+        "Execution Root: __EXECUTION_ROOT__",
+        "Branch: main",
+        "Timestamp: 2026-06-24T03:10:00.000Z",
+        "Report Path: __REPORT_PATH__",
         "Result: pass",
         "",
         "## Reasons",
@@ -554,8 +691,12 @@ function approvalReviewReport() {
     ].join("\n");
 }
 function readyTask() {
+    return readyTaskFor(TASK_ID);
+}
+function readyTaskFor(taskId) {
     return {
         ...baseTask(),
+        id: taskId,
         status: "ready-for-approval",
         build: {
             status: "passed",

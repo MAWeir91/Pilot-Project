@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { buildReportFile } from "./paths.js";
+import { taskBuildReportFile } from "./paths.js";
 import { maintenanceStatus, taskArtifactRoot } from "./execution.js";
 import { readLogTail, readTextIfExists } from "./logs.js";
 import { StateStore } from "./state.js";
@@ -11,7 +11,7 @@ export async function getProjectStatus(store = new StateStore(), projects = new 
     const taskProjectId = latestTask?.projectId ?? DEFAULT_PROJECT_ID;
     const statusProject = latestTask && taskProjectId !== activeProject.id ? await projects.getProject(taskProjectId) : activeProject;
     const artifactRoot = taskArtifactRoot(statusProject);
-    const buildReport = await readTextIfExists(buildReportFile(artifactRoot));
+    const buildReport = latestTask ? await readTextIfExists(taskBuildReportFile(artifactRoot, latestTask.id)) : undefined;
     const git = getGitStatus(artifactRoot);
     const latestTaskStatus = latestTask ? deriveTaskStatus(latestTask) : undefined;
     return {
@@ -65,7 +65,7 @@ function summarizeTestStatus(taskStatus, report) {
     if (!report) {
         return {
             latestTaskStatus: taskStatus ?? null,
-            summary: "No BUILD_REPORT.md found."
+            summary: "No canonical task-scoped BUILD_REPORT.md found."
         };
     }
     const relevantLines = report
@@ -74,6 +74,6 @@ function summarizeTestStatus(taskStatus, report) {
         .slice(-20);
     return {
         latestTaskStatus: taskStatus ?? null,
-        summary: relevantLines.join("\n") || "BUILD_REPORT.md exists, but no test lines were detected."
+        summary: relevantLines.join("\n") || "Canonical task-scoped BUILD_REPORT.md exists, but no test lines were detected."
     };
 }

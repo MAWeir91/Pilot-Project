@@ -33,9 +33,9 @@ It also serves a local task dashboard at:
 - `start_plan`: starts a read-only Codex planning pass in a registered project and captures `PLAN_REPORT.md`.
 - `create_task_from_plan`: creates a queued implementation task from a `plan-ready` plan without starting implementation.
 - `start_build`: writes `TASK.md` in the selected project's execution root, starts `codex --ask-for-approval never exec --cd <execution-root> --sandbox danger-full-access --json`, and captures JSONL logs. Normal projects use their registered root as the execution root.
-- `get_build_status`: returns queued/running/passed/failed/stopped status, log tail, and `BUILD_REPORT.md` when available.
+- `get_build_status`: returns queued/running/passed/failed/stopped status, log tail, and the current task's canonical `.project-pilot/reports/<task-id>/BUILD_REPORT.md` when available.
 - `list_tasks`: returns all current tasks newest first with dashboard status, build summary, review result, and latest log lines.
-- `run_review`: starts a second `codex --ask-for-approval never exec --cd <execution-root> --sandbox danger-full-access --json` review. The review prompt instructs Codex to perform a read-only independent review; Project Pilot writes `REVIEW_REPORT.md` from the captured report text.
+- `run_review`: starts a second `codex --ask-for-approval never exec --cd <execution-root> --sandbox danger-full-access --json` review. The review prompt instructs Codex to perform a read-only independent review; Project Pilot writes `.project-pilot/reports/<task-id>/REVIEW_REPORT.md` from the captured report text.
 - `approve_task`: manually approves a valid `ready-for-approval` task with an explicit reason and, when risk flags exist, confirmation that the cited risk evidence was reviewed. It does not modify the target project, run Git, commit, push, merge, or deploy.
 - `decline_task`: records an approval decline reason, keeps the task work intact, and leaves the related Autopilot run paused.
 - `finalize_task`: auto-completes policy-eligible safe tasks or returns `manual_approval_required` with exact reasons.
@@ -51,7 +51,8 @@ It also serves a local task dashboard at:
 - Runtime limits use active runtime, not wall-clock age. Paused, blocked, quota-waiting, user-waiting, idle, and server-down intervals do not consume active runtime budget.
 - Codex workers run with full local filesystem and network access using `--sandbox danger-full-access` and approval policy `never`. Use Project Pilot only on personal machines and trusted projects.
 - The project registry controls every execution root passed to Codex with `--cd`; task and plan tools accept `projectId`, never arbitrary filesystem paths.
-- Projects may define an explicit `executionRoot` distinct from their registered `path`. `TASK.md`, `BUILD_REPORT.md`, `REVIEW_REPORT.md`, `PLAN_REPORT.md`, maintenance worker logs, Codex working directories, and task-local command evidence are resolved from the execution root.
+- Projects may define an explicit `executionRoot` distinct from their registered `path`. `TASK.md`, task-scoped canonical reports under `.project-pilot/reports/<task-id>/`, `PLAN_REPORT.md`, maintenance worker logs, Codex working directories, and task-local command evidence are resolved from the execution root.
+- Root-level `BUILD_REPORT.md` and `REVIEW_REPORT.md` may remain as human-facing legacy artifacts, but controller verification trusts them only when report type, task ID, run ID, execution root, branch, timestamp, and report path match the current task exactly. Otherwise status explains the rejection and points to the canonical task-scoped report path.
 - Project Pilot self-maintenance projects must enable `maintenance`, set the live checkout as `maintenance.liveRoot`, set a known `maintenance.baseBranch`, and use an isolated execution worktree. Before planning, build, review, or Autopilot dispatch launches a worker, Project Pilot verifies the execution root exists, is a Git repository root, is a listed worktree, is not the live Project Pilot checkout, has a known base branch, and has either a clean working tree or an explicit dirty-working-tree reason.
 - Failed maintenance Git preflight blocks the task or plan, pauses Autopilot before worker launch, and records bounded diagnostics such as expected base branch, current branch, dirty file count, and relevant paths. It does not inspect or expose file contents, credentials, `.env`, tunnel keys, or live `data/`.
 - Planning workers run with `--sandbox read-only` and Project Pilot writes `PLAN_REPORT.md` from the captured plan report envelope.
@@ -206,8 +207,8 @@ Do not paste secrets into tasks, reports, logs, issue text, or documentation. If
 
 Use this sequence after a maintenance branch is ready for operator review:
 
-1. Verify local readiness: dashboard readiness is not `blocked`, maintenance status is `ready`, the task build passed, review passed or is `ready-for-approval`, and `BUILD_REPORT.md` reports `Final status: passed`.
-2. Inspect the isolated worktree diff, `BUILD_REPORT.md`, and `REVIEW_REPORT.md`. Confirm no secrets, live `data/`, tunnel keys, or unintended files are included.
+1. Verify local readiness: dashboard readiness is not `blocked`, maintenance status is `ready`, the task build passed, review passed or is `ready-for-approval`, and `.project-pilot/reports/<task-id>/BUILD_REPORT.md` reports `Final status: passed`.
+2. Inspect the isolated worktree diff and the task-scoped `.project-pilot/reports/<task-id>/BUILD_REPORT.md` and `.project-pilot/reports/<task-id>/REVIEW_REPORT.md`. Confirm no secrets, live `data/`, tunnel keys, or unintended files are included.
 3. If Project Pilot approval/finalization is appropriate, use the dashboard or MCP approval tools. These tools record approval state only; they do not commit, push, merge, deploy, or restart the live service.
 4. Stop the local launcher with `Ctrl+C` or `npm run local:stop` when there is no active local work that must continue.
 5. Perform any commit, push, pull request, merge, live-checkout update, deployment, or live-service restart manually under the operator's normal Git and service runbook.
@@ -217,7 +218,7 @@ The handoff point is step 5. Project Pilot's local maintenance workflow ends wit
 
 ### Failed Local Run Recovery
 
-1. Preserve the local evidence first: `TASK.md`, `BUILD_REPORT.md`, `REVIEW_REPORT.md`, `PLAN_REPORT.md`, dashboard status, and relevant log tails.
+1. Preserve the local evidence first: `TASK.md`, `.project-pilot/reports/<task-id>/BUILD_REPORT.md`, `.project-pilot/reports/<task-id>/REVIEW_REPORT.md`, `PLAN_REPORT.md`, dashboard status, and relevant log tails.
 2. Run `npm run local:status` to identify whether the failure is launcher, tunnel, state-store, scheduler, active-run, or configuration related.
 3. For duplicate port or tunnel failures, stop the terminal that owns the old process, or use `npm run local:stop` only for launcher-owned PIDs.
 4. For blocked maintenance preflight, fix the isolated worktree condition shown in readiness: wrong branch, missing worktree, dirty tree without reason, missing base branch, or execution root pointing at the live checkout.

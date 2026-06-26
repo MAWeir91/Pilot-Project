@@ -26,8 +26,24 @@ ${criteria}
 `;
 }
 
-export function buildPrompt(taskId: string, options: { executionRoot?: string; configuredCommands?: string[] } = {}): string {
+export function buildPrompt(
+  taskId: string,
+  options: {
+    executionRoot?: string;
+    configuredCommands?: string[];
+    reportPath?: string;
+    runId?: string | null;
+    branch?: string;
+    timestamp?: string;
+  } = {}
+): string {
   const commands = (options.configuredCommands ?? []).map((command) => `  - \`${command}\``).join("\n");
+  const resultRecords = (options.configuredCommands ?? [])
+    .map(
+      (command) =>
+        `PROJECT_PILOT_COMMAND_RESULT {"command":${JSON.stringify(command)},"attempt":1,"status":"passed|failed|unknown","exitCode":0,"startedAt":"ISO-8601 timestamp","endedAt":"ISO-8601 timestamp"}`
+    )
+    .join("\n");
   return `You are Codex running under Project Pilot for task ${taskId}.
 
 Read AGENTS.md first if present, then read TASK.md. Implement only the task described in TASK.md.
@@ -39,22 +55,32 @@ Required behavior:
 - Run relevant tests, lint, and build commands available in the project.
 - Treat these configured verification commands as required when present:
 ${commands || "  - No configured commands were provided by the controller."}
-- Write BUILD_REPORT.md with:
-  - Task ID
+- Write the canonical build report at: ${options.reportPath ?? ".project-pilot/reports/<task-id>/BUILD_REPORT.md"}
+- The report must include:
+  - Report Type: build
+  - Task ID: ${taskId}
+  - Run ID: ${options.runId ?? "none"}
   - Execution Root: ${options.executionRoot ?? "current working directory"}
+  - Branch: ${options.branch ?? "unknown"}
+  - Timestamp: ${options.timestamp ?? "current ISO-8601 timestamp"}
+  - Report Path: ${options.reportPath ?? ".project-pilot/reports/<task-id>/BUILD_REPORT.md"}
   - Summary of changes
   - Files changed
-  - Commands run and results
+  - Commands run and results as explicit structured records, one per command attempt:
+${resultRecords || "    PROJECT_PILOT_COMMAND_RESULT {\"command\":\"no configured commands\",\"attempt\":1,\"status\":\"unknown\",\"exitCode\":null}"}
   - Acceptance criteria status
   - Final status: passed, failed, or blocked
 
 Finish by reporting the same final status in your final response.`;
 }
 
-export function reviewPrompt(taskId: string): string {
+export function reviewPrompt(
+  taskId: string,
+  options: { executionRoot?: string; buildReportPath?: string; reviewReportPath?: string; runId?: string | null; branch?: string; timestamp?: string } = {}
+): string {
   return `You are Codex running a read-only Project Pilot review for task ${taskId}.
 
-Do not modify files. Inspect TASK.md, git diff, available test configuration/results, and BUILD_REPORT.md.
+Do not modify files. Inspect TASK.md, git diff, available test configuration/results, and the canonical build report at ${options.buildReportPath ?? ".project-pilot/reports/<task-id>/BUILD_REPORT.md"}.
 You may run read-only inspection commands. Avoid commands that write caches, install dependencies, deploy, push, merge, commit, delete files, or request credentials.
 
 Return a review report in this exact envelope:
@@ -62,7 +88,13 @@ Return a review report in this exact envelope:
 REVIEW_REPORT_START
 # Review Report
 
+Report Type: review
 Task ID: ${taskId}
+Run ID: ${options.runId ?? "none"}
+Execution Root: ${options.executionRoot ?? "current working directory"}
+Branch: ${options.branch ?? "unknown"}
+Timestamp: ${options.timestamp ?? "current ISO-8601 timestamp"}
+Report Path: ${options.reviewReportPath ?? ".project-pilot/reports/<task-id>/REVIEW_REPORT.md"}
 Result: pass | needs-fixes | blocked
 
 ## Reasons

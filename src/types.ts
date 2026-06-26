@@ -275,6 +275,22 @@ export interface TaskDetails extends TaskSummary {
   reviewLog: string;
   buildReport: string | null;
   reviewReport: string | null;
+  evidencePaths: {
+    buildReport: string;
+    reviewReport: string;
+    canonicalBuildReport: string;
+    canonicalReviewReport: string;
+    legacyBuildReport: string;
+    legacyReviewReport: string;
+  };
+  verificationIdentity: {
+    taskId: string;
+    runId: string | null;
+    executionRoot: string;
+    branch: string;
+    buildEvidenceDiagnostic?: string;
+    reviewEvidenceDiagnostic?: string;
+  };
   verification: VerificationRecord[];
   verificationEvents: VerificationAuditEvent[];
   approvalActions?: ApprovalActionRecord[];

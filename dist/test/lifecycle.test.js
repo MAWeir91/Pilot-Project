@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { JobService } from "../src/jobs.js";
 import { NullTaskNotifier } from "../src/notifications.js";
-import { dataPath } from "../src/paths.js";
+import { dataPath, taskBuildReportFile, taskReportsDir, taskReviewReportFile } from "../src/paths.js";
 import { ProjectRegistry } from "../src/projects.js";
 import { StateStore } from "../src/state.js";
 const TASK_ID = "task-2026-06-24T02-00-00-000Z-cccccccc";
@@ -67,7 +67,8 @@ describe("job lifecycle reconciliation", () => {
             acceptanceCriteria: ["Structured verification is stored."]
         });
         await waitFor(() => expect(spawnJob).toHaveBeenCalledTimes(1));
-        await fs.writeFile(`${projectPath}\\BUILD_REPORT.md`, buildReportFor(started.taskId), "utf8");
+        await fs.mkdir(taskReportsDir(projectPath, started.taskId), { recursive: true });
+        await fs.writeFile(taskBuildReportFile(projectPath, started.taskId), buildReportFor(started.taskId, projectPath, taskBuildReportFile(projectPath, started.taskId)), "utf8");
         onClose?.(0, null, "");
         await waitFor(async () => {
             const saved = await store.getTask(started.taskId);
@@ -170,25 +171,9 @@ describe("job lifecycle reconciliation", () => {
         const registryFile = dataPath("lifecycle-projects-restart.json");
         STATE_FILES.push(projectPath, registryFile);
         await fs.mkdir(projectPath, { recursive: true });
-        await fs.writeFile(`${projectPath}\\BUILD_REPORT.md`, [
-            "# Build Report",
-            "",
-            `Task ID: ${TASK_ID}`,
-            "",
-            "## Commands Run and Results",
-            "",
-            "- `npm test`",
-            "  - Result: passed; tests passed.",
-            "- `npm run check`",
-            "  - Result: passed; checks passed.",
-            "- `npm run build`",
-            "  - Result: passed; build passed.",
-            "",
-            "## Final Status",
-            "",
-            "passed"
-        ].join("\n"), "utf8");
-        await fs.writeFile(`${projectPath}\\REVIEW_REPORT.md`, ["# Review Report", "", `Task ID: ${TASK_ID}`, "Result: pass", "", "- Review passed."].join("\n"), "utf8");
+        await fs.mkdir(taskReportsDir(projectPath, TASK_ID), { recursive: true });
+        await fs.writeFile(taskBuildReportFile(projectPath, TASK_ID), buildReportFor(TASK_ID, projectPath, taskBuildReportFile(projectPath, TASK_ID)), "utf8");
+        await fs.writeFile(taskReviewReportFile(projectPath, TASK_ID), reviewReportFor(TASK_ID, projectPath, taskReviewReportFile(projectPath, TASK_ID)), "utf8");
         const projects = new ProjectRegistry(registryFile, () => "2026-06-24T02:10:00.000Z");
         await projects.registerProject({
             id: "lifecycle-project",
@@ -305,21 +290,41 @@ function fakeChild(pid) {
         kill: vi.fn()
     };
 }
-function buildReportFor(taskId) {
+function buildReportFor(taskId, executionRoot, reportPath) {
     return [
         "# Build Report",
         "",
+        "Report Type: build",
         `Task ID: ${taskId}`,
+        "Run ID: none",
+        `Execution Root: ${executionRoot}`,
+        "Branch: main",
+        "Timestamp: 2026-06-24T02:10:00.000Z",
+        `Report Path: ${reportPath}`,
         "",
         "## Commands Run and Results",
         "",
-        "- `npm test` - passed. Tests passed.",
-        "- `npm run check` - passed. Checks passed.",
-        "- `npm run build` - passed. Build passed.",
+        'PROJECT_PILOT_COMMAND_RESULT {"command":"npm test","attempt":1,"status":"passed","exitCode":0}',
+        'PROJECT_PILOT_COMMAND_RESULT {"command":"npm run check","attempt":1,"status":"passed","exitCode":0}',
+        'PROJECT_PILOT_COMMAND_RESULT {"command":"npm run build","attempt":1,"status":"passed","exitCode":0}',
         "",
-        "## Final Status",
+        "Final Status: passed"
+    ].join("\n");
+}
+function reviewReportFor(taskId, executionRoot, reportPath) {
+    return [
+        "# Review Report",
         "",
-        "passed"
+        "Report Type: review",
+        `Task ID: ${taskId}`,
+        "Run ID: none",
+        `Execution Root: ${executionRoot}`,
+        "Branch: main",
+        "Timestamp: 2026-06-24T02:10:00.000Z",
+        `Report Path: ${reportPath}`,
+        "Result: pass",
+        "",
+        "- Review passed."
     ].join("\n");
 }
 async function waitFor(assertion) {
