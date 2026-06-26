@@ -463,6 +463,60 @@ describe("manager mode", () => {
     expect(status.queue.filter((item) => item.status === "active")).toHaveLength(1);
   });
 
+  it("reconciles stopped active worker leases into a recoverable audited state", async () => {
+    const { service, store, jobs } = await harness({ configured: true });
+    const run = await createStartedRun(service);
+    const taskId = "task-2026-06-24T06-00-00-000Z-deadbeef";
+    await store.addTask({
+      id: taskId,
+      projectId: "trade-journal-lite",
+      title: "Stopped task",
+      requirements: "Worker was stopped.",
+      acceptanceCriteria: ["Lease is recovered."],
+      status: "stopped",
+      createdAt: "2026-06-24T06:00:00.000Z",
+      updatedAt: "2026-06-24T06:01:00.000Z",
+      build: {
+        status: "stopped",
+        logPath: dataPath(`${taskId}.build.jsonl`),
+        endedAt: "2026-06-24T06:01:00.000Z",
+        exitCode: null,
+        error: "Stopped by user request."
+      }
+    });
+    await store.updateAutopilotRun(run.runId, (existing) => ({
+      ...existing,
+      currentTaskId: taskId,
+      phase: "building",
+      workers: [
+        {
+          id: "lease-stopped",
+          runId: run.runId,
+          taskId,
+          phase: "build",
+          command: "codex build worker",
+          startedAt: "2026-06-24T06:00:00.000Z",
+          attemptType: "manager",
+          reportPath: dataPath("stopped-build-report.md"),
+          expectedArtifact: "BUILD_REPORT.md",
+          status: "active"
+        }
+      ]
+    }));
+
+    await service.tick(run.runId);
+    const status = await service.getAutopilotStatus(run.runId);
+
+    expect(status.workers?.[0]).toMatchObject({
+      id: "lease-stopped",
+      status: "recovered",
+      outcome: "Task was stopped; active worker lease recovered."
+    });
+    expect(status.timeline.some((entry) => entry.summary.includes("Reconciled 1 stale worker lease"))).toBe(true);
+    expect(status.status).toBe("blocked");
+    expect(jobs.startBuild).not.toHaveBeenCalled();
+  });
+
   it("queues one operational recovery for a stale blocked current task", async () => {
     const taskId = "task-2026-06-24T06-00-00-000Z-lostpid1";
     const { service, store } = await harness({ configured: true });

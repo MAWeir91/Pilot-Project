@@ -5,6 +5,10 @@ export const PROJECT_PILOT_ROOT = path.resolve(
   process.env.PROJECT_PILOT_ROOT ?? process.cwd()
 );
 
+export const PROJECT_PILOT_LIVE_ROOT = path.resolve(
+  process.env.PROJECT_PILOT_LIVE_ROOT ?? path.join(PROJECT_PILOT_ROOT, "..", "project-pilot")
+);
+
 export const ALLOWLISTED_PROJECT_ROOT = path.resolve(
   PROJECT_PILOT_ROOT,
   "..",
@@ -68,9 +72,12 @@ export function dataPath(fileName: string): string {
 export function registeredProjectRoots(): string[] {
   try {
     const text = fs.readFileSync(PROJECTS_FILE, "utf8");
-    const parsed = JSON.parse(text) as { projects?: Array<{ path?: unknown }> };
+    const parsed = JSON.parse(text) as { projects?: Array<{ path?: unknown; executionRoot?: unknown }> };
     const roots = (parsed.projects ?? [])
-      .map((project) => (typeof project.path === "string" ? path.resolve(project.path) : ""))
+      .flatMap((project) => [
+        typeof project.path === "string" ? path.resolve(project.path) : "",
+        typeof project.executionRoot === "string" ? path.resolve(project.executionRoot) : ""
+      ])
       .filter(Boolean);
     return roots.length > 0 ? [...new Set(roots)] : [ALLOWLISTED_PROJECT_ROOT];
   } catch {

@@ -31,10 +31,10 @@ It also serves a local task dashboard at:
 - `stop_autopilot`: stops a Manager Mode run.
 - `start_plan`: starts a read-only Codex planning pass in a registered project and captures `PLAN_REPORT.md`.
 - `create_task_from_plan`: creates a queued implementation task from a `plan-ready` plan without starting implementation.
-- `start_build`: writes `TASK.md` in the selected registered project, starts `codex --ask-for-approval never exec --cd <registered-project-root> --sandbox danger-full-access --json`, and logs JSONL output under `data/`.
+- `start_build`: writes `TASK.md` in the selected project's execution root, starts `codex --ask-for-approval never exec --cd <execution-root> --sandbox danger-full-access --json`, and captures JSONL logs. Normal projects use their registered root as the execution root.
 - `get_build_status`: returns queued/running/passed/failed/stopped status, log tail, and `BUILD_REPORT.md` when available.
 - `list_tasks`: returns all current tasks newest first with dashboard status, build summary, review result, and latest log lines.
-- `run_review`: starts a second `codex --ask-for-approval never exec --cd <registered-project-root> --sandbox danger-full-access --json` review. The review prompt instructs Codex to perform a read-only independent review; Project Pilot writes `REVIEW_REPORT.md` from the captured report text.
+- `run_review`: starts a second `codex --ask-for-approval never exec --cd <execution-root> --sandbox danger-full-access --json` review. The review prompt instructs Codex to perform a read-only independent review; Project Pilot writes `REVIEW_REPORT.md` from the captured report text.
 - `approve_task`: manually approves a valid `ready-for-approval` task with an explicit reason and, when risk flags exist, confirmation that the cited risk evidence was reviewed. It does not modify the target project, run Git, commit, push, merge, or deploy.
 - `decline_task`: records an approval decline reason, keeps the task work intact, and leaves the related Autopilot run paused.
 - `finalize_task`: auto-completes policy-eligible safe tasks or returns `manual_approval_required` with exact reasons.
@@ -49,7 +49,10 @@ It also serves a local task dashboard at:
 - Autopilot runs build tasks sequentially with one active worker per project, run the independent review after a successful build, and pause on blocked operations, API errors, repeated build/review failures, or configured run limits.
 - Runtime limits use active runtime, not wall-clock age. Paused, blocked, quota-waiting, user-waiting, idle, and server-down intervals do not consume active runtime budget.
 - Codex workers run with full local filesystem and network access using `--sandbox danger-full-access` and approval policy `never`. Use Project Pilot only on personal machines and trusted projects.
-- The project registry controls every project root passed to Codex with `--cd`; task and plan tools accept `projectId`, never arbitrary filesystem paths.
+- The project registry controls every execution root passed to Codex with `--cd`; task and plan tools accept `projectId`, never arbitrary filesystem paths.
+- Projects may define an explicit `executionRoot` distinct from their registered `path`. `TASK.md`, `BUILD_REPORT.md`, `REVIEW_REPORT.md`, `PLAN_REPORT.md`, maintenance worker logs, Codex working directories, and task-local command evidence are resolved from the execution root.
+- Project Pilot self-maintenance projects must enable `maintenance`, set the live checkout as `maintenance.liveRoot`, set a known `maintenance.baseBranch`, and use an isolated execution worktree. Before planning, build, review, or Autopilot dispatch launches a worker, Project Pilot verifies the execution root exists, is a Git repository root, is a listed worktree, is not the live Project Pilot checkout, has a known base branch, and has either a clean working tree or an explicit dirty-working-tree reason.
+- Failed maintenance Git preflight blocks the task or plan, pauses Autopilot before worker launch, and records bounded diagnostics such as expected base branch, current branch, dirty file count, and relevant paths. It does not inspect or expose file contents, credentials, `.env`, tunnel keys, or live `data/`.
 - Planning workers run with `--sandbox read-only` and Project Pilot writes `PLAN_REPORT.md` from the captured plan report envelope.
 - Build and review workers run with `--sandbox danger-full-access`.
 - Codex is always spawned with `shell: false`.
@@ -65,7 +68,7 @@ It also serves a local task dashboard at:
 - Existing manual-approval blocks remain for secrets, deployments, external services, databases, brokerage access, financial credentials, payments, network exposure, and destructive data changes.
 - Active build and review PIDs are persisted, reconciled on startup/status reads, and never duplicated automatically.
 - Autopilot scheduling is heartbeat-driven and single-flight per run. Queued recovery, fix, and task work dispatches after manager decisions, terminal worker events, startup reconciliation, and user resume without requiring server restarts.
-- Worker leases are persisted for build, review, recovery, fix, and finalization phases. Lost process tracking is treated as operational recovery, distinct from reviewer-requested engineering fixes.
+- Worker leases are persisted for build, review, recovery, fix, and finalization phases. Scheduler reconciliation closes stale active leases as completed, recovered, or dead based on task state and tracked PID liveness, with timeline audit entries before any new dispatch. Lost process tracking is treated as operational recovery, distinct from reviewer-requested engineering fixes.
 - JSON state files use serialized per-file transactions and Windows-safe durable writes through same-directory temp files, synced snapshots, bounded transient-error retries, and corruption recovery from valid snapshots only when the live file is invalid.
 - Default timeouts are 15 minutes for builds and 8 minutes for reviews.
 

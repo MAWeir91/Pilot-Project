@@ -1,6 +1,7 @@
 import path from "node:path";
 import fs from "node:fs";
 export const PROJECT_PILOT_ROOT = path.resolve(process.env.PROJECT_PILOT_ROOT ?? process.cwd());
+export const PROJECT_PILOT_LIVE_ROOT = path.resolve(process.env.PROJECT_PILOT_LIVE_ROOT ?? path.join(PROJECT_PILOT_ROOT, "..", "project-pilot"));
 export const ALLOWLISTED_PROJECT_ROOT = path.resolve(PROJECT_PILOT_ROOT, "..", "trade-journal-lite");
 export const DATA_DIR = path.join(PROJECT_PILOT_ROOT, "data");
 export const STATE_FILE = path.join(DATA_DIR, "tasks.json");
@@ -50,7 +51,10 @@ export function registeredProjectRoots() {
         const text = fs.readFileSync(PROJECTS_FILE, "utf8");
         const parsed = JSON.parse(text);
         const roots = (parsed.projects ?? [])
-            .map((project) => (typeof project.path === "string" ? path.resolve(project.path) : ""))
+            .flatMap((project) => [
+            typeof project.path === "string" ? path.resolve(project.path) : "",
+            typeof project.executionRoot === "string" ? path.resolve(project.executionRoot) : ""
+        ])
             .filter(Boolean);
         return roots.length > 0 ? [...new Set(roots)] : [ALLOWLISTED_PROJECT_ROOT];
     }

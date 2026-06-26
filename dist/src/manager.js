@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as z from "zod/v4";
 import { evaluateApprovalPolicy } from "./approval-policy.js";
 import { buildReportFile, reviewReportFile } from "./paths.js";
+import { taskArtifactRoot } from "./execution.js";
 import { ProjectRegistry } from "./projects.js";
 import { StateStore } from "./state.js";
 import { deriveTaskStatus } from "./task-status.js";
@@ -198,6 +199,7 @@ export class AutopilotService {
     config;
     now;
     autoSchedule;
+    processExists;
     activeTicks = new Set();
     heartbeatTimers = new Map();
     constructor(options) {
@@ -210,6 +212,7 @@ export class AutopilotService {
         this.notifier = options.notifier ?? new NullAutopilotNotifier();
         this.now = options.now ?? (() => new Date().toISOString());
         this.autoSchedule = options.autoSchedule ?? true;
+        this.processExists = options.processExists ?? defaultProcessExists;
     }
     configurationStatus() {
         return managerConfigurationStatus(this.config);
@@ -460,6 +463,8 @@ export class AutopilotService {
             await this.pauseFor(run.id, "Manager decision budget reached.", "usage-limited");
             return;
         }
+        await this.reconcileWorkerLeases(run.id);
+        run = await this.requireRun(run.id);
         const activeTask = run.currentTaskId ? await this.store.getTask(run.currentTaskId) : undefined;
         if (activeTask) {
             const advanced = await this.advanceActiveTask(run, activeTask);
@@ -625,7 +630,7 @@ export class AutopilotService {
                 attemptType: "manager",
                 command: "codex review worker",
                 startedAt: this.now(),
-                reportPath: reviewReportFile(project.path),
+                reportPath: reviewReportFile(taskArtifactRoot(project)),
                 expectedArtifact: "REVIEW_REPORT.md"
             });
             await this.updateRun(run.id, (existing) => ({
@@ -709,7 +714,7 @@ export class AutopilotService {
             case "revise_plan": {
                 try {
                     const consultation = await this.architect.consult({
-                        projectRoot: project.path,
+                        projectRoot: taskArtifactRoot(project),
                         threadId: run.codexThreads.architectThreadId,
                         prompt: `Project brief: ${brief.title}\n\n${brief.productSummary}\n\n${brief.requirements}\n\nManager request: ${decision.summary}`
                     });
@@ -926,6 +931,23 @@ export class AutopilotService {
             acceptanceCriteria: next.acceptanceCriteria
         };
         const project = await this.projects.getProject(projectId);
+        const preflightRunner = this.jobs;
+        if (typeof preflightRunner.preflightWorkerLaunch === "function") {
+            const preflight = preflightRunner.preflightWorkerLaunch(project);
+            if (!preflight.ok) {
+                await this.updateRun(runId, (existing) => ({
+                    ...existing,
+                    scheduler: {
+                        ...(existing.scheduler ?? {}),
+                        dispatchStatus: "maintenance-preflight-blocked",
+                        lastDispatchOutcome: preflight.reason ?? "Maintenance Git preflight failed."
+                    },
+                    timeline: appendTimeline(existing, this.now(), "status", `Maintenance worker launch blocked: ${preflight.reason ?? "Git preflight failed."}`, { diagnostics: preflight.diagnostics })
+                }));
+                await this.pauseFor(runId, preflight.reason ?? "Maintenance Git preflight failed.", "blocked");
+                return;
+            }
+        }
         const preparedStarter = this.jobs;
         if (typeof preparedStarter.prepareBuild === "function" && typeof preparedStarter.launchPreparedBuild === "function") {
             const prepared = await preparedStarter.prepareBuild(taskInput);
@@ -940,7 +962,7 @@ export class AutopilotService {
                 attemptType: next.source === "recovery" ? "recovery" : next.source === "fix" ? "reviewer-fix" : "manager",
                 command: "codex build worker",
                 startedAt: this.now(),
-                reportPath: buildReportFile(project.path),
+                reportPath: buildReportFile(taskArtifactRoot(project)),
                 expectedArtifact: "BUILD_REPORT.md"
             });
             await this.store.transaction((state) => {
@@ -963,7 +985,7 @@ export class AutopilotService {
             attemptType: next.source === "recovery" ? "recovery" : next.source === "fix" ? "reviewer-fix" : "manager",
             command: "codex build worker",
             startedAt: this.now(),
-            reportPath: buildReportFile(project.path),
+            reportPath: buildReportFile(taskArtifactRoot(project)),
             expectedArtifact: "BUILD_REPORT.md"
         });
         await this.updateRun(runId, (existing) => launchQueuedTaskRunState(existing, next, started.taskId, lease, this.now()));
@@ -994,6 +1016,77 @@ export class AutopilotService {
                 skippedDispatchReason: status === "skipped" ? reason : existing.scheduler?.skippedDispatchReason
             }
         }));
+    }
+    async reconcileWorkerLeases(runId) {
+        const run = await this.requireRun(runId);
+        const activeLeases = (run.workers ?? []).filter((lease) => lease.status === "active");
+        if (activeLeases.length === 0) {
+            return;
+        }
+        const reconciled = [];
+        const tasks = await this.store.listTasks();
+        const tasksById = new Map(tasks.map((task) => [task.id, task]));
+        const activeTaskIds = new Set([run.currentTaskId, ...run.queue.filter((item) => item.status === "active").map((item) => item.taskId)].filter(Boolean));
+        const workers = (run.workers ?? []).map((lease) => {
+            if (lease.status !== "active") {
+                return lease;
+            }
+            const result = this.classifyWorkerLease(lease, tasksById.get(lease.taskId), activeTaskIds);
+            if (!result) {
+                return lease;
+            }
+            reconciled.push({ leaseId: lease.id, taskId: lease.taskId, ...result });
+            return {
+                ...lease,
+                status: result.status,
+                endedAt: this.now(),
+                lastActivityAt: this.now(),
+                outcome: result.outcome
+            };
+        });
+        if (reconciled.length === 0) {
+            return;
+        }
+        await this.updateRun(runId, (existing) => ({
+            ...existing,
+            workers,
+            scheduler: {
+                ...(existing.scheduler ?? {}),
+                dispatchStatus: "leases-reconciled",
+                lastDispatchOutcome: `Reconciled ${reconciled.length} stale worker lease(s).`
+            },
+            timeline: appendTimeline(existing, this.now(), "status", `Reconciled ${reconciled.length} stale worker lease(s).`, {
+                leases: reconciled
+            })
+        }));
+    }
+    classifyWorkerLease(lease, task, activeTaskIds) {
+        if (lease.pid !== undefined && !this.processExists(lease.pid)) {
+            return { status: "dead", outcome: `Tracked worker PID ${lease.pid} is no longer running.` };
+        }
+        if (!task) {
+            return { status: "dead", outcome: "Worker lease references a missing task record." };
+        }
+        const status = deriveTaskStatus(task);
+        if (status === "completed") {
+            return { status: "completed", outcome: "Task completed." };
+        }
+        if (status === "build-passed" && lease.phase === "build") {
+            return { status: "completed", outcome: "Build worker completed and task advanced to review eligibility." };
+        }
+        if (status === "ready-for-approval" || status === "needs-fixes") {
+            return { status: "completed", outcome: `Review worker completed with task status ${status}.` };
+        }
+        if (status === "stopped") {
+            return { status: "recovered", outcome: "Task was stopped; active worker lease recovered." };
+        }
+        if (status === "failed" || status === "blocked") {
+            return { status: "dead", outcome: `Task ended with terminal status ${status}.` };
+        }
+        if (!activeTaskIds.has(lease.taskId)) {
+            return { status: "recovered", outcome: "Lease was active but the run no longer has this task active." };
+        }
+        return undefined;
     }
     async pauseFor(runId, reason, status) {
         const run = await this.updateRun(runId, (existing) => pauseRun(existing, reason, this.now(), status));
@@ -1177,6 +1270,15 @@ function isOperationalRecoveryDecision(decision) {
 function isOperationalWorkerLoss(task) {
     const text = [task.build.error, task.review?.error].filter(Boolean).join("\n");
     return /\b(pid|terminal event|process was not successfully tracked|no longer running|missing terminal)\b/i.test(text);
+}
+function defaultProcessExists(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    }
+    catch (error) {
+        return error.code === "EPERM";
+    }
 }
 function createBriefId() {
     return `brief-${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID().slice(0, 8)}`;

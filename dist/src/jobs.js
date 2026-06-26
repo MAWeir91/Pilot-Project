@@ -4,6 +4,7 @@ import { CODEX_ACCESS_MODE, CODEX_ACCESS_WARNING, CODEX_APPROVAL_POLICY, assertP
 import { readLogTail, readTextIfExists, extractPlanReport, extractReviewReport } from "./logs.js";
 import { buildPrompt, planPrompt, renderTaskMarkdown, reviewPrompt } from "./prompts.js";
 import { StateStore } from "./state.js";
+import { preflightWorkerLaunch, taskArtifactRoot, taskLocalLogPath } from "./execution.js";
 import { completeReadyTask, deriveTaskStatus } from "./task-status.js";
 import { WindowsTaskNotifier } from "./notifications.js";
 import { evaluateApprovalPolicy, parseVerificationRecords, projectVerificationCommands } from "./approval-policy.js";
@@ -20,6 +21,7 @@ export class JobService {
     buildTimeoutMs;
     reviewTimeoutMs;
     now;
+    gitRunner;
     constructor(store = new StateStore(), notifier = new WindowsTaskNotifier(), options = {}) {
         this.store = store;
         this.projects = options.projects ?? new ProjectRegistry();
@@ -30,13 +32,19 @@ export class JobService {
         this.buildTimeoutMs = options.buildTimeoutMs ?? DEFAULT_BUILD_TIMEOUT_MS;
         this.reviewTimeoutMs = options.reviewTimeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
         this.now = options.now ?? (() => new Date().toISOString());
+        this.gitRunner = options.gitRunner;
     }
     async startBuild(input) {
         const prepared = await this.prepareBuild(input);
         if (prepared.duplicate) {
             return { taskId: prepared.task.id, status: deriveTaskStatus(prepared.task) };
         }
-        await fs.writeFile(assertAllowedPath(taskFile(prepared.project.path)), renderTaskMarkdown(prepared.task.id, prepared.input), "utf8");
+        const preflight = this.preflightWorkerLaunch(prepared.project);
+        if (!preflight.ok) {
+            await this.store.addTask(blockPreparedBuild(prepared.task, preflight.reason ?? "Maintenance Git preflight failed.", this.now()));
+            return { taskId: prepared.task.id, status: "blocked" };
+        }
+        await fs.writeFile(assertAllowedPath(taskFile(taskArtifactRoot(prepared.project))), renderTaskMarkdown(prepared.task.id, prepared.input), "utf8");
         await this.store.addTask(prepared.task);
         this.launchPreparedBuild(prepared);
         return { taskId: prepared.task.id, status: "queued" };
@@ -55,7 +63,7 @@ export class JobService {
         }
         const taskId = createTaskId();
         const now = this.now();
-        const logPath = buildLogPath(taskId, "build");
+        const logPath = this.workerLogPath(project, taskId, "build");
         const task = {
             id: taskId,
             projectId: project.id,
@@ -76,7 +84,12 @@ export class JobService {
         if (prepared.duplicate) {
             return;
         }
-        await fs.writeFile(assertAllowedPath(taskFile(prepared.project.path)), renderTaskMarkdown(prepared.task.id, prepared.input), "utf8");
+        const preflight = this.preflightWorkerLaunch(prepared.project);
+        if (!preflight.ok) {
+            await this.blockBuild(prepared.task.id, preflight.reason ?? "Maintenance Git preflight failed.");
+            return;
+        }
+        await fs.writeFile(assertAllowedPath(taskFile(taskArtifactRoot(prepared.project))), renderTaskMarkdown(prepared.task.id, prepared.input), "utf8");
         setImmediate(() => {
             void this.launchBuild(prepared.task.id, prepared.project, prepared.logPath);
         });
@@ -96,12 +109,15 @@ export class JobService {
     async getActiveProject() {
         return await this.projects.getActiveProject();
     }
+    preflightWorkerLaunch(project) {
+        return preflightWorkerLaunch(project, this.gitRunner);
+    }
     async getBuildStatus(taskId) {
         assertTaskId(taskId);
         await this.reconcileTask(taskId);
         const task = await this.requireTask(taskId);
         const project = await this.projectForTask(task);
-        const buildReport = await readTextIfExists(buildReportFile(project.path));
+        const buildReport = await readTextIfExists(buildReportFile(taskArtifactRoot(project)));
         return {
             taskId,
             status: task.build.status,
@@ -278,8 +294,8 @@ export class JobService {
             errors: collectErrors(task),
             buildLog: (await readTextIfExists(task.build.logPath)) ?? "",
             reviewLog: task.review?.logPath ? (await readTextIfExists(task.review.logPath)) ?? "" : "",
-            buildReport: (await readTextIfExists(buildReportFile(project.path))) ?? null,
-            reviewReport: (await readTextIfExists(reviewReportFile(project.path))) ?? null,
+            buildReport: (await readTextIfExists(buildReportFile(taskArtifactRoot(project)))) ?? null,
+            reviewReport: (await readTextIfExists(reviewReportFile(taskArtifactRoot(project)))) ?? null,
             approvalActions: task.approvalActions ?? [],
             approval
         };
@@ -290,7 +306,17 @@ export class JobService {
         await this.assertNoActiveReview(taskId);
         const task = await this.requireTask(taskId);
         const project = await this.projectForTask(task);
-        const logPath = buildLogPath(taskId, "review");
+        const preflight = this.preflightWorkerLaunch(project);
+        if (!preflight.ok) {
+            await this.blockReview(taskId, preflight.reason ?? "Maintenance Git preflight failed.");
+            return {
+                taskId,
+                taskStatus: "blocked",
+                result: "blocked",
+                error: preflight.reason ?? "Maintenance Git preflight failed."
+            };
+        }
+        const logPath = this.workerLogPath(project, taskId, "review");
         const now = this.now();
         await this.updateTaskAndNotify(taskId, (existing) => ({
             ...existing,
@@ -315,7 +341,8 @@ export class JobService {
         const project = await this.projects.getProject(input.projectId);
         const planId = createPlanId();
         const now = this.now();
-        const logPath = buildPlanLogPath(planId);
+        const logPath = this.planLogPath(project, planId);
+        const preflight = this.preflightWorkerLaunch(project);
         const plan = {
             id: planId,
             projectId: project.id,
@@ -326,9 +353,13 @@ export class JobService {
             createdAt: now,
             updatedAt: now,
             logPath,
-            reportPath: planReportFile(project.path)
+            reportPath: planReportFile(taskArtifactRoot(project))
         };
         await this.store.addPlan(plan);
+        if (!preflight.ok) {
+            await this.blockPlan(planId, preflight.reason ?? "Maintenance Git preflight failed.");
+            return { planId, status: "queued" };
+        }
         setImmediate(() => {
             void this.launchPlan(planId, project, input, logPath);
         });
@@ -398,6 +429,10 @@ export class JobService {
                 ? input.acceptanceCriteria
                 : ["Implementation follows the approved plan.", "Configured project checks pass.", "Independent review passes."]
         };
+        const preflight = this.preflightWorkerLaunch(project);
+        if (!preflight.ok) {
+            throw new Error(`Cannot create task from plan until maintenance Git preflight passes: ${preflight.reason ?? "Git preflight failed."}`);
+        }
         const duplicate = await this.findDuplicateTask(project.id, taskInput);
         if (duplicate) {
             return {
@@ -419,10 +454,10 @@ export class JobService {
             updatedAt: this.now(),
             build: {
                 status: "queued",
-                logPath: buildLogPath(taskId, "build")
+                logPath: this.workerLogPath(project, taskId, "build")
             }
         };
-        await fs.writeFile(assertAllowedPath(taskFile(project.path)), renderTaskMarkdown(taskId, taskInput), "utf8");
+        await fs.writeFile(assertAllowedPath(taskFile(taskArtifactRoot(project))), renderTaskMarkdown(taskId, taskInput), "utf8");
         await this.store.addTask(task);
         return {
             taskId,
@@ -643,7 +678,7 @@ export class JobService {
         };
         try {
             child = this.spawnJob({
-                projectRoot: project.path,
+                projectRoot: taskArtifactRoot(project),
                 sandbox: "danger-full-access",
                 prompt: buildPrompt(taskId),
                 logPath,
@@ -703,7 +738,7 @@ export class JobService {
         };
         try {
             child = this.spawnJob({
-                projectRoot: project.path,
+                projectRoot: taskArtifactRoot(project),
                 sandbox: "danger-full-access",
                 prompt: reviewPrompt(taskId),
                 logPath,
@@ -765,7 +800,8 @@ export class JobService {
             if (!finalError && exitCode === 0) {
                 const extracted = extractPlanReport(stdoutText, planId);
                 if (extracted.report) {
-                    await fs.writeFile(assertAllowedPath(planReportFile(project.path)), extracted.report, "utf8");
+                    const plan = await this.requirePlan(planId);
+                    await fs.writeFile(assertAllowedPath(plan.reportPath), extracted.report, "utf8");
                 }
                 const validation = await this.validatePlanReport(await this.requirePlan(planId));
                 if (validation.ok) {
@@ -792,7 +828,7 @@ export class JobService {
         };
         try {
             child = this.spawnJob({
-                projectRoot: project.path,
+                projectRoot: taskArtifactRoot(project),
                 sandbox: "read-only",
                 prompt: planPrompt(planId, input),
                 logPath,
@@ -849,7 +885,7 @@ export class JobService {
     }
     async applyReviewResult(taskId, project, logPath, result, exitCode, report, error) {
         if (report) {
-            await fs.writeFile(assertAllowedPath(reviewReportFile(project.path)), report, "utf8");
+            await fs.writeFile(assertAllowedPath(reviewReportFile(taskArtifactRoot(project))), report, "utf8");
         }
         const reviewStatus = result === "pass" ? "passed" : result === "needs-fixes" ? "failed" : "blocked";
         const taskStatus = result === "pass" ? "ready-for-approval" : result === "needs-fixes" ? "needs-fixes" : "blocked";
@@ -885,7 +921,8 @@ export class JobService {
     }
     async blockReview(taskId, reason) {
         const task = await this.requireTask(taskId);
-        const logPath = task.review?.logPath ?? buildLogPath(taskId, "review");
+        const project = await this.projectForTask(task);
+        const logPath = task.review?.logPath ?? this.workerLogPath(project, taskId, "review");
         const tail = await readLogTail(logPath, 20);
         const error = tail ? `${reason}\nLast log lines:\n${tail}` : reason;
         await this.updateTaskAndNotify(taskId, (existing) => ({
@@ -931,7 +968,7 @@ export class JobService {
         }));
     }
     async readMatchingReviewResult(taskId, project) {
-        const report = await readTextIfExists(reviewReportFile(project.path));
+        const report = await readTextIfExists(reviewReportFile(taskArtifactRoot(project)));
         if (!report || !report.includes(`Task ID: ${taskId}`)) {
             return undefined;
         }
@@ -1007,8 +1044,8 @@ export class JobService {
     async evaluateTaskApproval(taskId) {
         const task = await this.reconcileVerification(taskId);
         const project = await this.projectForTask(task);
-        const buildReport = await readTextIfExists(buildReportFile(project.path));
-        const reviewReport = await readTextIfExists(reviewReportFile(project.path));
+        const buildReport = await readTextIfExists(buildReportFile(taskArtifactRoot(project)));
+        const reviewReport = await readTextIfExists(reviewReportFile(taskArtifactRoot(project)));
         return evaluateApprovalPolicy({
             task,
             buildReport,
@@ -1020,13 +1057,13 @@ export class JobService {
     async reconcileVerification(taskId) {
         const task = await this.requireTask(taskId);
         const project = await this.projectForTask(task);
-        const buildReport = await readTextIfExists(buildReportFile(project.path));
+        const buildReport = await readTextIfExists(buildReportFile(taskArtifactRoot(project)));
         const verification = parseVerificationRecords({
             buildReport,
             configuredCommands: projectVerificationCommands(project),
             startedAt: task.build.startedAt,
             endedAt: task.build.endedAt,
-            outputRef: buildReportFile(project.path)
+            outputRef: buildReportFile(taskArtifactRoot(project))
         });
         if (verification.length === 0 && (!task.verification || task.verification.length === 0)) {
             return task;
@@ -1068,8 +1105,8 @@ export class JobService {
             codexAccessWarning: CODEX_ACCESS_WARNING,
             approval: evaluateApprovalPolicy({
                 task,
-                buildReport: await readTextIfExists(buildReportFile(project.path)),
-                reviewReport: await readTextIfExists(reviewReportFile(project.path)),
+                buildReport: await readTextIfExists(buildReportFile(taskArtifactRoot(project))),
+                reviewReport: await readTextIfExists(reviewReportFile(taskArtifactRoot(project))),
                 configuredCommands: projectVerificationCommands(project),
                 verification: task.verification
             }),
@@ -1109,6 +1146,14 @@ export class JobService {
         return tasks.find((task) => (task.projectId ?? DEFAULT_PROJECT_ID) === projectId &&
             taskInputScopeKey(task) === candidateKey &&
             duplicateKeeperStatus(deriveTaskStatus(task)));
+    }
+    workerLogPath(project, taskId, kind) {
+        const localLogPath = taskLocalLogPath(project, `${taskId}.${kind}.jsonl`);
+        return localLogPath || buildLogPath(taskId, kind);
+    }
+    planLogPath(project, planId) {
+        const localLogPath = taskLocalLogPath(project, `${planId}.plan.jsonl`);
+        return localLogPath || buildPlanLogPath(planId);
     }
 }
 function defaultProcessExists(pid) {
@@ -1150,6 +1195,20 @@ function buildTaskStatus(status) {
         return "failed";
     }
     return "building";
+}
+function blockPreparedBuild(task, reason, endedAt) {
+    return {
+        ...task,
+        status: "blocked",
+        updatedAt: endedAt,
+        build: {
+            ...task.build,
+            status: "blocked",
+            exitCode: null,
+            endedAt,
+            error: reason
+        }
+    };
 }
 function duplicateKeeperStatus(status) {
     return !["failed", "blocked", "stopped"].includes(status);
@@ -1285,8 +1344,10 @@ function validatePlanReportContent(report, planId) {
     if (!normalized.trim()) {
         return { ok: false, reason: "PLAN_REPORT.md is missing or empty." };
     }
-    if (!normalized.includes(`Plan ID: ${planId}`)) {
-        return { ok: false, reason: `PLAN_REPORT.md does not contain matching Plan ID: ${planId}.` };
+    const reportPlanIds = extractPlanIds(normalized);
+    if (!reportPlanIds.includes(planId)) {
+        const found = reportPlanIds.length > 0 ? reportPlanIds.join(", ") : "none";
+        return { ok: false, reason: `PLAN_REPORT.md Plan ID mismatch. Expected ${planId}; found ${found}.` };
     }
     const requiredSections = [
         "Summary Of The Request",
@@ -1325,6 +1386,10 @@ function extractSection(report, heading) {
     const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const match = report.match(new RegExp(`##\\s+${escaped}\\s*\\r?\\n([\\s\\S]*?)(?=\\r?\\n##\\s+|$)`, "i"));
     return match?.[1]?.trim() ?? "";
+}
+function extractPlanIds(report) {
+    const matches = [...report.matchAll(/\bPlan ID:\s*(plan-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-[a-f0-9]{8})\b/gi)];
+    return [...new Set(matches.map((match) => match[1]))];
 }
 function kindTitle(kind) {
     return kind === "build" ? "Build" : kind === "review" ? "Review" : "Plan";

@@ -105,12 +105,14 @@ export class ProjectRegistry {
             id,
             name: requiredText(input.name, "name"),
             path: projectPath,
+            executionRoot: optionalAbsolutePath(input.executionRoot, "executionRoot"),
             gitRemoteName: optionalText(input.gitRemoteName),
             buildCommand: requiredText(input.buildCommand, "buildCommand"),
             testCommand: requiredText(input.testCommand, "testCommand"),
             checkCommand: requiredText(input.checkCommand, "checkCommand"),
             defaultBranchName: requiredText(input.defaultBranchName, "defaultBranchName"),
             allowedGitBehavior: requiredText(input.allowedGitBehavior, "allowedGitBehavior"),
+            maintenance: normalizeMaintenanceConfig(input.maintenance, projectPath, input.defaultBranchName),
             createdAt: now,
             updatedAt: now
         };
@@ -125,7 +127,15 @@ export function assertProjectId(projectId) {
 function normalizeProject(project) {
     return {
         ...project,
-        path: path.resolve(project.path)
+        path: path.resolve(project.path),
+        executionRoot: project.executionRoot ? path.resolve(project.executionRoot) : undefined,
+        maintenance: project.maintenance
+            ? {
+                ...project.maintenance,
+                liveRoot: path.resolve(project.maintenance.liveRoot),
+                baseBranch: requiredText(project.maintenance.baseBranch, "maintenance.baseBranch")
+            }
+            : undefined
     };
 }
 function normalizeRegistryState(value) {
@@ -148,4 +158,31 @@ function requiredText(value, field) {
 function optionalText(value) {
     const trimmed = value?.trim();
     return trimmed ? trimmed : undefined;
+}
+function optionalAbsolutePath(value, field) {
+    const trimmed = optionalText(value);
+    if (!trimmed) {
+        return undefined;
+    }
+    if (!path.isAbsolute(trimmed)) {
+        throw new Error(`${field} must be absolute.`);
+    }
+    return path.resolve(trimmed);
+}
+function normalizeMaintenanceConfig(maintenance, projectPath, defaultBranchName) {
+    if (!maintenance?.enabled) {
+        return undefined;
+    }
+    const liveRoot = maintenance.liveRoot ? optionalAbsolutePath(maintenance.liveRoot, "maintenance.liveRoot") : projectPath;
+    const baseBranch = requiredText(maintenance.baseBranch ?? defaultBranchName, "maintenance.baseBranch");
+    const dirtyWorkingTreeReason = optionalText(maintenance.dirtyWorkingTreeReason);
+    if (maintenance.allowDirtyWorkingTree && !dirtyWorkingTreeReason) {
+        throw new Error("maintenance.dirtyWorkingTreeReason is required when allowDirtyWorkingTree is true.");
+    }
+    return {
+        enabled: true,
+        liveRoot,
+        baseBranch,
+        ...(maintenance.allowDirtyWorkingTree ? { allowDirtyWorkingTree: true, dirtyWorkingTreeReason } : {})
+    };
 }

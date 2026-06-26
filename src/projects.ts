@@ -1,7 +1,7 @@
 import path from "node:path";
 import { DurableJsonFile } from "./durable-json.js";
 import { ALLOWLISTED_PROJECT_ROOT, PROJECTS_FILE, assertAllowedPath } from "./paths.js";
-import type { ProjectRecord, ProjectRegistryState } from "./types.js";
+import type { ProjectMaintenanceConfig, ProjectRecord, ProjectRegistryState } from "./types.js";
 
 export const DEFAULT_PROJECT_ID = "trade-journal-lite";
 
@@ -9,12 +9,14 @@ export interface RegisterProjectInput {
   id: string;
   name: string;
   path: string;
+  executionRoot?: string;
   gitRemoteName?: string;
   buildCommand: string;
   testCommand: string;
   checkCommand: string;
   defaultBranchName: string;
   allowedGitBehavior: string;
+  maintenance?: Partial<ProjectMaintenanceConfig> & Pick<ProjectMaintenanceConfig, "enabled">;
 }
 
 export class ProjectRegistry {
@@ -130,12 +132,14 @@ export class ProjectRegistry {
       id,
       name: requiredText(input.name, "name"),
       path: projectPath,
+      executionRoot: optionalAbsolutePath(input.executionRoot, "executionRoot"),
       gitRemoteName: optionalText(input.gitRemoteName),
       buildCommand: requiredText(input.buildCommand, "buildCommand"),
       testCommand: requiredText(input.testCommand, "testCommand"),
       checkCommand: requiredText(input.checkCommand, "checkCommand"),
       defaultBranchName: requiredText(input.defaultBranchName, "defaultBranchName"),
       allowedGitBehavior: requiredText(input.allowedGitBehavior, "allowedGitBehavior"),
+      maintenance: normalizeMaintenanceConfig(input.maintenance, projectPath, input.defaultBranchName),
       createdAt: now,
       updatedAt: now
     };
@@ -152,7 +156,15 @@ export function assertProjectId(projectId: string): string {
 function normalizeProject(project: ProjectRecord): ProjectRecord {
   return {
     ...project,
-    path: path.resolve(project.path)
+    path: path.resolve(project.path),
+    executionRoot: project.executionRoot ? path.resolve(project.executionRoot) : undefined,
+    maintenance: project.maintenance
+      ? {
+          ...project.maintenance,
+          liveRoot: path.resolve(project.maintenance.liveRoot),
+          baseBranch: requiredText(project.maintenance.baseBranch, "maintenance.baseBranch")
+        }
+      : undefined
   };
 }
 
@@ -179,4 +191,39 @@ function requiredText(value: string, field: string): string {
 function optionalText(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
+}
+
+function optionalAbsolutePath(value: string | undefined, field: string): string | undefined {
+  const trimmed = optionalText(value);
+  if (!trimmed) {
+    return undefined;
+  }
+  if (!path.isAbsolute(trimmed)) {
+    throw new Error(`${field} must be absolute.`);
+  }
+  return path.resolve(trimmed);
+}
+
+function normalizeMaintenanceConfig(
+  maintenance: RegisterProjectInput["maintenance"],
+  projectPath: string,
+  defaultBranchName: string
+): ProjectMaintenanceConfig | undefined {
+  if (!maintenance?.enabled) {
+    return undefined;
+  }
+
+  const liveRoot = maintenance.liveRoot ? optionalAbsolutePath(maintenance.liveRoot, "maintenance.liveRoot")! : projectPath;
+  const baseBranch = requiredText(maintenance.baseBranch ?? defaultBranchName, "maintenance.baseBranch");
+  const dirtyWorkingTreeReason = optionalText(maintenance.dirtyWorkingTreeReason);
+  if (maintenance.allowDirtyWorkingTree && !dirtyWorkingTreeReason) {
+    throw new Error("maintenance.dirtyWorkingTreeReason is required when allowDirtyWorkingTree is true.");
+  }
+
+  return {
+    enabled: true,
+    liveRoot,
+    baseBranch,
+    ...(maintenance.allowDirtyWorkingTree ? { allowDirtyWorkingTree: true, dirtyWorkingTreeReason } : {})
+  };
 }

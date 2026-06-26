@@ -91,14 +91,24 @@ export interface ProjectRecord {
   id: string;
   name: string;
   path: string;
+  executionRoot?: string;
   gitRemoteName?: string;
   buildCommand: string;
   testCommand: string;
   checkCommand: string;
   defaultBranchName: string;
   allowedGitBehavior: string;
+  maintenance?: ProjectMaintenanceConfig;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface ProjectMaintenanceConfig {
+  enabled: boolean;
+  liveRoot: string;
+  baseBranch: string;
+  allowDirtyWorkingTree?: boolean;
+  dirtyWorkingTreeReason?: string;
 }
 
 export interface ProjectRegistryState {
