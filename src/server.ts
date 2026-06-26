@@ -77,6 +77,11 @@ type RequestHandlerHost = {
 type CreateAppOptions = {
   reconcileOnStart?: boolean;
 };
+type AppWithStartupReconciliation = express.Express & {
+  locals: express.Express["locals"] & {
+    startupReconciliation?: Promise<void>;
+  };
+};
 
 function jsonToolResult(value: unknown) {
   return {
@@ -774,8 +779,14 @@ export function createApp(
 ): express.Express {
   const app = express();
   if (options.reconcileOnStart ?? true) {
-    void jobService.reconcileUnfinishedTasks();
-    void autopilotService.reconcileAndResume();
+    const startupReconciliation: Promise<void> = Promise.all([
+      jobService.reconcileUnfinishedTasks(),
+      autopilotService.reconcileAndResume()
+    ]).then(() => undefined);
+    app.locals.startupReconciliation = startupReconciliation;
+    void startupReconciliation.catch((error: unknown) => {
+      console.error(`Startup reconciliation failed: ${errorMessage(error)}`);
+    });
   }
   app.use(express.json({ limit: "1mb" }));
   app.use((req, res, next) => {
@@ -993,6 +1004,10 @@ export function createApp(
   });
 
   return app;
+}
+
+export function startupReconciliationFor(app: express.Express): Promise<void> | undefined {
+  return (app as AppWithStartupReconciliation).locals.startupReconciliation;
 }
 
 function isLoopbackAddress(address: string | undefined): boolean {

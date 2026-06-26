@@ -4,7 +4,7 @@ import { JobService } from "../src/jobs.js";
 import { AutopilotService, NullAutopilotNotifier } from "../src/manager.js";
 import { NullTaskNotifier } from "../src/notifications.js";
 import { dataPath } from "../src/paths.js";
-import { acquireInstanceLock, createApp, createServer } from "../src/server.js";
+import { acquireInstanceLock, createApp, createServer, startupReconciliationFor } from "../src/server.js";
 import { StateStore } from "../src/state.js";
 describe("MCP server connector metadata", () => {
     let httpServer;
@@ -207,7 +207,7 @@ describe("MCP server connector metadata", () => {
                             requirements: "Operational recovery.",
                             acceptanceCriteria: ["Recovery is visible."],
                             source: "recovery",
-                            taskId: "task-2026-06-24T01-05-00-000Z-recover1",
+                            taskId: recoveredTaskId,
                             status: "completed",
                             fixAttemptForTaskId: blockedTaskId,
                             createdAt: "2026-06-24T01:00:00.000Z",
@@ -294,6 +294,7 @@ describe("MCP server connector metadata", () => {
             ]
         }, null, 2)}\n`, "utf8");
         const stateStore = new StateStore(stateFile);
+        expectNoOrphanAutopilotTaskReferences(await stateStore.read());
         const service = new JobService(stateStore, new NullTaskNotifier());
         const autopilotService = new AutopilotService({
             store: stateStore,
@@ -302,8 +303,10 @@ describe("MCP server connector metadata", () => {
             autoSchedule: false,
             processExists: () => true
         });
+        const app = createApp(service, autopilotService, stateStore);
+        await startupReconciliationFor(app);
         await new Promise((resolve) => {
-            httpServer = createApp(service, autopilotService, stateStore).listen(0, "127.0.0.1", resolve);
+            httpServer = app.listen(0, "127.0.0.1", resolve);
         });
         const address = httpServer.address();
         baseUrl = `http://127.0.0.1:${address.port}`;
@@ -558,7 +561,9 @@ describe("dashboard bounded read snapshots", () => {
         await fs.rm(stateFile, { force: true });
     });
     it("serves core dashboard endpoints quickly from a bounded snapshot without service side effects or state mutation", async () => {
-        await fs.writeFile(stateFile, `${JSON.stringify(largeDashboardState(missingLogFile), null, 2)}\n`, "utf8");
+        const fixture = largeDashboardState(missingLogFile);
+        expectNoOrphanAutopilotTaskReferences(fixture);
+        await fs.writeFile(stateFile, `${JSON.stringify(fixture, null, 2)}\n`, "utf8");
         const stateStore = new StateStore(stateFile);
         const service = new JobService(stateStore, new NullTaskNotifier());
         const autopilotService = new AutopilotService({
@@ -612,7 +617,14 @@ describe("dashboard bounded read snapshots", () => {
             calls.configurationStatus += 1;
             throw new Error("dashboard reads must not call configurationStatus");
         };
-        const { httpServer, baseUrl } = await listen(createApp(service, autopilotService, stateStore, { reconcileOnStart: false }));
+        const unhandledRejections = [];
+        const onUnhandledRejection = (reason) => {
+            unhandledRejections.push(reason);
+        };
+        process.on("unhandledRejection", onUnhandledRejection);
+        const app = createApp(service, autopilotService, stateStore, { reconcileOnStart: false });
+        expect(startupReconciliationFor(app)).toBeUndefined();
+        const { httpServer, baseUrl } = await listen(app);
         try {
             const before = await fs.readFile(stateFile, "utf8");
             const tasks = await timedJson(`${baseUrl}/dashboard/tasks`);
@@ -663,8 +675,11 @@ describe("dashboard bounded read snapshots", () => {
                 getRun: 0,
                 configurationStatus: 0
             });
+            await new Promise((resolve) => setImmediate(resolve));
+            expect(unhandledRejections).toEqual([]);
         }
         finally {
+            process.off("unhandledRejection", onUnhandledRejection);
             await closeServer(httpServer);
         }
     });
@@ -979,4 +994,18 @@ function verificationRecords(taskId) {
             explanation: "Persisted by large dashboard fixture."
         }
     }));
+}
+function expectNoOrphanAutopilotTaskReferences(state) {
+    const taskIds = new Set(state.tasks.map((task) => task.id));
+    for (const run of state.autopilotRuns ?? []) {
+        const referencedTaskIds = [
+            run.currentTaskId,
+            run.lastCompletedTaskId,
+            ...Object.keys(run.fixAttemptsByTaskId ?? {}),
+            ...Object.keys(run.recoveryAttemptsByTaskId ?? {}),
+            ...(run.queue ?? []).flatMap((item) => [item.taskId, item.fixAttemptForTaskId]),
+            ...(run.workers ?? []).map((worker) => worker.taskId)
+        ].filter((taskId) => Boolean(taskId));
+        expect(referencedTaskIds.filter((taskId) => !taskIds.has(taskId))).toEqual([]);
+    }
 }

@@ -709,8 +709,15 @@ export class JobService {
   async reconcileUnfinishedTasks(): Promise<void> {
     const tasks = await this.store.listTasks();
     for (const task of tasks) {
-      await this.reconcileTask(task.id);
-      await this.reconcileVerification(task.id);
+      try {
+        await this.reconcileTask(task.id);
+        await this.reconcileVerification(task.id);
+      } catch (error) {
+        if (this.isUnknownTaskError(error, task.id)) {
+          continue;
+        }
+        throw error;
+      }
     }
     const plans = await this.store.listPlans();
     for (const plan of plans) {
@@ -1345,6 +1352,10 @@ export class JobService {
       throw new Error(`Unknown taskId: ${taskId}`);
     }
     return task;
+  }
+
+  private isUnknownTaskError(error: unknown, taskId: string): boolean {
+    return errorMessage(error) === `Unknown taskId: ${taskId}`;
   }
 
   private async requirePlan(planId: string): Promise<PlanRecord> {

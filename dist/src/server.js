@@ -562,8 +562,14 @@ export function createServer() {
 export function createApp(jobService = jobs, autopilotService = autopilot, stateStore = store, options = {}) {
     const app = express();
     if (options.reconcileOnStart ?? true) {
-        void jobService.reconcileUnfinishedTasks();
-        void autopilotService.reconcileAndResume();
+        const startupReconciliation = Promise.all([
+            jobService.reconcileUnfinishedTasks(),
+            autopilotService.reconcileAndResume()
+        ]).then(() => undefined);
+        app.locals.startupReconciliation = startupReconciliation;
+        void startupReconciliation.catch((error) => {
+            console.error(`Startup reconciliation failed: ${errorMessage(error)}`);
+        });
     }
     app.use(express.json({ limit: "1mb" }));
     app.use((req, res, next) => {
@@ -765,6 +771,9 @@ export function createApp(jobService = jobs, autopilotService = autopilot, state
         });
     });
     return app;
+}
+export function startupReconciliationFor(app) {
+    return app.locals.startupReconciliation;
 }
 function isLoopbackAddress(address) {
     return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";

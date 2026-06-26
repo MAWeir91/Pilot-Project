@@ -198,6 +198,14 @@ describe("job lifecycle reconciliation", () => {
     expect(spawnJob).not.toHaveBeenCalled();
   });
 
+  it("skips a task that disappears during background reconciliation without weakening direct task operations", async () => {
+    const { service, store } = await serviceWithTask(passedBuildTask());
+    vi.spyOn(store, "getTask").mockResolvedValue(undefined);
+
+    await expect(service.reconcileUnfinishedTasks()).resolves.toBeUndefined();
+    await expect(service.approveTask(TASK_ID)).rejects.toThrow(`Unknown taskId: ${TASK_ID}`);
+  });
+
   it("reconciles a completed review worker from reports after restart", async () => {
     const projectPath = dataPath("lifecycle-project-restart");
     const registryFile = dataPath("lifecycle-projects-restart.json");
