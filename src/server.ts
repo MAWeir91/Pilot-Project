@@ -434,7 +434,6 @@ export function createServer(): McpServer {
       }
     },
     async () => {
-      await jobs.reconcileUnfinishedTasks();
       return jsonToolResult(await getProjectStatus());
     }
   );

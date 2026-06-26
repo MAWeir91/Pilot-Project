@@ -174,7 +174,8 @@ export function validateMaintenanceExecutionConfig(project, input, runner = runG
     return { executionRoot, maintenance: candidate.maintenance, preflight };
 }
 export function maintenanceStatus(project, runner = runGit) {
-    const preflight = preflightWorkerLaunch(project, runner);
+    const preflight = readOnlyMaintenancePreflight(project, runner);
+    const sanitizedPreflight = sanitizePreflight(preflight);
     const maintenance = project.maintenance?.enabled
         ? {
             enabled: true,
@@ -194,10 +195,51 @@ export function maintenanceStatus(project, runner = runGit) {
         };
     return {
         ...maintenance,
-        preflight: sanitizePreflight(preflight),
+        status: preflight.ok ? "ready" : "blocked",
+        readOnly: true,
+        preflight: sanitizedPreflight,
         canStart: preflight.ok,
-        cannotStartReason: preflight.ok ? null : preflight.reason
+        cannotStartReason: preflight.ok ? null : sanitizedPreflight.reason
     };
+}
+export function maintenanceStatusFromError(projectId, error) {
+    const reason = `Unable to inspect maintenance readiness: ${errorMessage(error)}`;
+    const preflight = {
+        ok: false,
+        executionRoot: "",
+        reason,
+        diagnostics: {
+            projectId,
+            diagnosticReadOnly: true
+        }
+    };
+    return {
+        enabled: null,
+        status: "blocked",
+        readOnly: true,
+        preflight: sanitizePreflight(preflight),
+        canStart: false,
+        cannotStartReason: redactSensitiveText(reason)
+    };
+}
+function readOnlyMaintenancePreflight(project, runner) {
+    try {
+        return preflightWorkerLaunch(project, runner);
+    }
+    catch (error) {
+        return {
+            ok: false,
+            executionRoot: redactSensitiveText(project.executionRoot ?? project.path),
+            reason: `Maintenance readiness diagnostic failed: ${errorMessage(error)}`,
+            diagnostics: {
+                projectId: project.id,
+                maintenanceMode: project.maintenance?.enabled === true,
+                registeredRoot: redactSensitiveText(project.path),
+                executionRoot: redactSensitiveText(project.executionRoot ?? project.path),
+                diagnosticReadOnly: true
+            }
+        };
+    }
 }
 function validateMaintenanceRoots(context, liveRoot) {
     if (!fs.existsSync(context.executionRoot) || !fs.statSync(context.executionRoot).isDirectory()) {

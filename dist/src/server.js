@@ -329,7 +329,6 @@ export function createServer() {
             securitySchemes: NOAUTH_SECURITY_SCHEMES
         }
     }, async () => {
-        await jobs.reconcileUnfinishedTasks();
         return jsonToolResult(await getProjectStatus());
     });
     server.registerTool("start_build", {

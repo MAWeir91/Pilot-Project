@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as z from "zod/v4";
 import { evaluateApprovalPolicy } from "./approval-policy.js";
 import { buildReportFile, reviewReportFile } from "./paths.js";
-import { maintenanceStatus, taskArtifactRoot } from "./execution.js";
+import { maintenanceStatus, maintenanceStatusFromError, taskArtifactRoot } from "./execution.js";
 import { ProjectRegistry } from "./projects.js";
 import { StateStore } from "./state.js";
 import { deriveTaskStatus } from "./task-status.js";
@@ -221,7 +221,7 @@ export class AutopilotService {
             projects: projectState.projects.map((project) => ({
                 projectId: project.id,
                 projectName: project.name,
-                maintenance: maintenanceStatus(project)
+                maintenance: this.maintenanceStatusForProject(project)
             }))
         };
     }
@@ -301,10 +301,14 @@ export class AutopilotService {
         return { runId: run.id, status: run.status, run };
     }
     async getAutopilotStatus(runId) {
-        return await this.requireRun(runId);
+        const run = await this.requireRun(runId);
+        return { ...run, maintenance: await this.maintenanceStatusForRun(run) };
     }
     async listAutopilotRuns() {
-        return { runs: await this.store.listAutopilotRuns() };
+        const runs = await this.store.listAutopilotRuns();
+        return {
+            runs: await Promise.all(runs.map(async (run) => ({ ...run, maintenance: await this.maintenanceStatusForRun(run) })))
+        };
     }
     async pauseAutopilot(runId, reason = "Paused by user request.") {
         const run = await this.updateRun(runId, (existing) => pauseRun(existing, reason, this.now()));
@@ -313,6 +317,31 @@ export class AutopilotService {
     }
     async resumeAutopilot(runId) {
         const now = this.now();
+        const existing = await this.requireRun(runId);
+        const preflight = await this.preflightRunForWorkerRelease(existing);
+        if (!preflight.ok) {
+            const reason = preflight.reason ?? "Maintenance Git preflight failed.";
+            const blocked = await this.updateRun(runId, (run) => ({
+                ...run,
+                status: "blocked",
+                phase: "paused",
+                pauseReason: reason,
+                pausedAt: now,
+                activeRuntimeStartedAt: undefined,
+                activeRuntimeMs: run.activeRuntimeMs ?? 0,
+                scheduler: {
+                    ...(run.scheduler ?? {}),
+                    dispatchStatus: "resume-preflight-blocked",
+                    lastDispatchOutcome: reason,
+                    skippedDispatchReason: reason
+                },
+                timeline: appendTimeline(run, now, "status", `Autopilot resume blocked: ${reason}`, {
+                    diagnostics: preflight.diagnostics
+                })
+            }));
+            this.notifier.notify("Project Pilot autopilot blocked", reason);
+            return blocked;
+        }
         const run = await this.updateRun(runId, (existing) => ({
             ...existing,
             status: "running",
@@ -935,6 +964,44 @@ export class AutopilotService {
             return preflightRunner.preflightWorkerLaunch(project);
         }
         return { ok: true, diagnostics: { projectId: project.id, maintenanceMode: project.maintenance?.enabled === true } };
+    }
+    async preflightRunForWorkerRelease(run) {
+        try {
+            const project = await this.projects.getProject(run.projectId);
+            return this.preflightProject(project);
+        }
+        catch (error) {
+            return {
+                ok: false,
+                reason: `Unable to validate Autopilot run project metadata: ${errorMessage(error)}`,
+                diagnostics: {
+                    runId: run.id,
+                    projectId: run.projectId,
+                    diagnosticReadOnly: false
+                }
+            };
+        }
+    }
+    async maintenanceStatusForRun(run) {
+        try {
+            const project = await this.projects.getProject(run.projectId);
+            return this.maintenanceStatusForProject(project);
+        }
+        catch (error) {
+            return maintenanceStatusFromError(run.projectId, error);
+        }
+    }
+    maintenanceStatusForProject(project) {
+        const statusReader = this.jobs;
+        try {
+            if (typeof statusReader.maintenanceStatus === "function") {
+                return statusReader.maintenanceStatus(project);
+            }
+            return maintenanceStatus(project);
+        }
+        catch (error) {
+            return maintenanceStatusFromError(project.id, error);
+        }
     }
     async startQueuedTask(runId, projectId, next) {
         const run = await this.requireRun(runId);
